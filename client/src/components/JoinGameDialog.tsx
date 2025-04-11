@@ -34,7 +34,7 @@ interface JoinGameDialogProps {
 }
 
 export const JoinGameDialog: React.FC<JoinGameDialogProps> = ({ onJoin }) => {
-  const [username, setUsername] = useState('Adventurer');
+  const [username, setUsername] = useState('');
   const [characterClass, setCharacterClass] = useState('Wizard');
 
   const handleSubmit = (event: React.FormEvent) => {
@@ -46,9 +46,9 @@ export const JoinGameDialog: React.FC<JoinGameDialogProps> = ({ onJoin }) => {
   return (
     <div style={styles.overlay}>
       <form style={styles.dialog} onSubmit={handleSubmit}>
-        <h2>Join Game</h2>
+        <h2>Join Session</h2>
         <div style={styles.inputGroup}>
-          <label htmlFor="username" style={styles.label}>Character Name:</label>
+          <label htmlFor="username" style={styles.label}>Your Name:</label>
           <input
             type="text"
             id="username"
@@ -59,19 +59,19 @@ export const JoinGameDialog: React.FC<JoinGameDialogProps> = ({ onJoin }) => {
           />
         </div>
         <div style={styles.inputGroup}>
-          <label htmlFor="characterClass" style={styles.label}>Class:</label>
+          <label htmlFor="characterClass" style={styles.label}>Character:</label>
           <select
             id="characterClass"
             value={characterClass}
             onChange={(e) => setCharacterClass(e.target.value)}
             style={styles.select}
           >
-            <option value="Wizard">Wizard</option>
-            <option value="Paladin">Paladin</option>
+            <option value="Wizard">Stripes Wizard</option>
+            <option value="Paladin">Bob</option>
             {/* Add more classes later */}
           </select>
         </div>
-        <button type="submit" style={styles.button}>Join Game</button>
+        <button type="submit" style={styles.button}>Join Session</button>
       </form>
     </div>
   );
