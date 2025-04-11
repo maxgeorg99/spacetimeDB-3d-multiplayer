@@ -67,7 +67,7 @@ export const DebugPanel: React.FC<DebugPanelProps> = ({
     setModelCheckResults([]);
     
     const results: string[] = [];
-    const modelTypes = ['wizard', 'paladin'];
+    const modelTypes = ['wizard', 'paladin','mario'];
     const modelPromises: Promise<Response>[] = [];
     
     // Check main model files

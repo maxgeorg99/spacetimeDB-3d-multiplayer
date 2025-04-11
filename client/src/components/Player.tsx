@@ -129,9 +129,18 @@ export const Player: React.FC<PlayerProps> = ({
   const animationsLoadedRef = useRef(false);
   
   // Main character model path
-  const mainModelPath = characterClass === 'Paladin' 
-    ? '/models/paladin/paladin.fbx'
-    : '/models/wizard/wizard.fbx';
+  const mainModelPath = (() => {
+    switch (characterClass) {
+        case 'Paladin':
+            return '/models/paladin/paladin.fbx';
+        case 'Wizard':
+            return '/models/wizard/wizard.fbx';
+        case 'Mario':
+            return '/models/mario/mario.fbx';
+        default:
+            return '/models/wizard/wizard.fbx';
+    }
+  })();
 
   // --- State variables ---
   const pointLightRef = useRef<THREE.PointLight>(null!); // Ref for the declarative light
@@ -221,7 +230,11 @@ export const Player: React.FC<PlayerProps> = ({
         if (group.current) {
           group.current.add(fbx);
           // Apply position adjustment after adding to group
-          fbx.position.y = -0.1; // Lower the model slightly
+          if (characterClass === 'Mario') {
+            fbx.position.y = -1; // Lower the model
+          } else {
+            fbx.position.y = -0.1; // Lower the model slightly
+          }
           
           // --- TRY AGAIN: Traverse to remove embedded lights --- 
           try { 
@@ -287,26 +300,27 @@ export const Player: React.FC<PlayerProps> = ({
     console.log(`Loading animations for ${characterClass}...`);
     
     const animationPaths: Record<string, string> = {};
-    const basePath = characterClass === 'Paladin' ? '/models/paladin/' : '/models/wizard/';
+    const basePath = characterClass === 'Mario' ? '/models/mario/' : (characterClass === 'Paladin' ? '/models/paladin/' : '/models/wizard/');
     
     // Map animation keys to file paths, ensuring exact matching of key names
     // Define all animation keys with their exact matching paths
+    // Map animation keys to file paths, ensuring exact matching of key names
     const animKeys = {
-      idle: characterClass === 'Wizard' ? 'wizard-standing-idle.fbx' : 'paladin-idle.fbx',
-      'walk-forward': characterClass === 'Wizard' ? 'wizard-standing-walk-forward.fbx' : 'paladin-walk-forward.fbx',
-      'walk-back': characterClass === 'Wizard' ? 'wizard-standing-walk-back.fbx' : 'paladin-walk-back.fbx',
-      'walk-left': characterClass === 'Wizard' ? 'wizard-standing-walk-left.fbx' : 'paladin-walk-left.fbx',
-      'walk-right': characterClass === 'Wizard' ? 'wizard-standing-walk-right.fbx' : 'paladin-walk-right.fbx',
-      'run-forward': characterClass === 'Wizard' ? 'wizard-standing-run-forward.fbx' : 'paladin-run-forward.fbx',
-      'run-back': characterClass === 'Wizard' ? 'wizard-standing-run-back.fbx' : 'paladin-run-back.fbx',
-      'run-left': characterClass === 'Wizard' ? 'wizard-standing-run-left.fbx' : 'paladin-run-left.fbx',
-      'run-right': characterClass === 'Wizard' ? 'wizard-standing-run-right.fbx' : 'paladin-run-right.fbx',
-      jump: characterClass === 'Wizard' ? 'wizard-standing-jump.fbx' : 'paladin-jump.fbx',
-      attack1: characterClass === 'Wizard' ? 'wizard-standing-1h-magic-attack-01.fbx' : 'paladin-attack.fbx',
-      cast: characterClass === 'Wizard' ? 'wizard-standing-2h-magic-area-attack-02.fbx' : 'paladin-cast.fbx',
-      damage: characterClass === 'Wizard' ? 'wizard-standing-react-small-from-front.fbx' : 'paladin-damage.fbx',
-      death: characterClass === 'Wizard' ? 'wizard-standing-react-death-backward.fbx' : 'paladin-death.fbx',
-    };
+      idle: characterClass === 'Mario' ? 'mario-idle.fbx' : (characterClass === 'Wizard' ? 'wizard-standing-idle.fbx' : 'paladin-idle.fbx'),
+      'walk-forward': characterClass === 'Mario' ? 'mario-walk-forward.fbx' : (characterClass === 'Wizard' ? 'wizard-standing-walk-forward.fbx' : 'paladin-walk-forward.fbx'),
+      'walk-back': characterClass === 'Mario' ? 'mario-walk-back.fbx' : (characterClass === 'Wizard' ? 'wizard-standing-walk-back.fbx' : 'paladin-walk-back.fbx'),
+      'walk-left': characterClass === 'Mario' ? 'mario-walk-left.fbx' : (characterClass === 'Wizard' ? 'wizard-standing-walk-left.fbx' : 'paladin-walk-left.fbx'),
+      'walk-right': characterClass === 'Mario' ? 'mario-walk-right.fbx' : (characterClass === 'Wizard' ? 'wizard-standing-walk-right.fbx' : 'paladin-walk-right.fbx'),
+      'run-forward': characterClass === 'Mario' ? 'mario-run-forward.fbx' : (characterClass === 'Wizard' ? 'wizard-standing-run-forward.fbx' : 'paladin-run-forward.fbx'),
+      'run-back': characterClass === 'Mario' ? 'mario-run-back.fbx' : (characterClass === 'Wizard' ? 'wizard-standing-run-back.fbx' : 'paladin-run-back.fbx'),
+      'run-left': characterClass === 'Mario' ? 'mario-run-left.fbx' : (characterClass === 'Wizard' ? 'wizard-standing-run-left.fbx' : 'paladin-run-left.fbx'),
+      'run-right': characterClass === 'Mario' ? 'mario-run-right.fbx' : (characterClass === 'Wizard' ? 'wizard-standing-run-right.fbx' : 'paladin-run-right.fbx'),
+      jump: characterClass === 'Mario' ? 'mario-idle.fbx' : (characterClass === 'Wizard' ? 'wizard-standing-jump.fbx' : 'paladin-jump.fbx'),
+      attack1: characterClass === 'Mario' ? 'mario-attack.fbx' : (characterClass === 'Wizard' ? 'wizard-standing-1h-magic-attack-01.fbx' : 'paladin-attack.fbx'),
+      cast: characterClass === 'Mario' ? 'mario-idle.fbx' : (characterClass === 'Wizard' ? 'wizard-standing-2h-magic-area-attack-02.fbx' : 'paladin-cast.fbx'),
+      damage: characterClass === 'Mario' ? 'mario-idle.fbx' : (characterClass === 'Wizard' ? 'wizard-standing-react-small-from-front.fbx' : 'paladin-damage.fbx'),
+      death: characterClass === 'Mario' ? 'mario-idle.fbx' : (characterClass === 'Wizard' ? 'wizard-standing-react-death-backward.fbx' : 'paladin-death.fbx'),
+  };
     
     // Create animation paths
     Object.entries(animKeys).forEach(([key, filename]) => {

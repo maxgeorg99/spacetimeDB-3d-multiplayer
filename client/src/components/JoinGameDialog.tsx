@@ -68,6 +68,7 @@ export const JoinGameDialog: React.FC<JoinGameDialogProps> = ({ onJoin }) => {
           >
             <option value="Wizard">Stripes Wizard</option>
             <option value="Paladin">Bob</option>
+            <option value="Mario">Mario</option>
             {/* Add more classes later */}
           </select>
         </div>
