@@ -37,11 +37,15 @@ import { Identity } from '@clockworklabs/spacetimedb-sdk';
 // Import generated type, assuming path from components dir
 import { PlayerData } from '../generated'; 
 
+interface ExtendedPlayerData extends PlayerData {
+  currentTile?: string;
+}
+
 interface DebugPanelProps {
   statusMessage: string;
-  localPlayer: PlayerData | null;
+  localPlayer: ExtendedPlayerData | null;
   identity: Identity | null;
-  playerMap: ReadonlyMap<string, PlayerData>; // Pass the whole map
+  playerMap: ReadonlyMap<string, ExtendedPlayerData>; // Pass the whole map
   expanded: boolean; // Receive expansion state from parent
   onToggleExpanded: () => void; // Receive toggle function from parent
   isPointerLocked: boolean; // Receive pointer lock state from parent
@@ -109,7 +113,7 @@ export const DebugPanel: React.FC<DebugPanelProps> = ({
   };
 
   // Derive player list array inside the component
-  const playerList: PlayerData[] = Array.from(playerMap.values()).sort((a, b) => 
+  const playerList: ExtendedPlayerData[] = Array.from(playerMap.values()).sort((a, b) => 
     a.identity.toHexString().localeCompare(b.identity.toHexString())
   );
 
@@ -156,7 +160,7 @@ export const DebugPanel: React.FC<DebugPanelProps> = ({
       {expanded && (
         <>
           <div style={{ marginTop: '10px' }}>
-            <strong>Identity:</strong> {identity ? identity.toHexString() : 'None'}
+            <strong>Identity:</strong> {identity ? identity.toHexString().substring(0, 8) : 'None'}...
           </div>
           
           {localPlayer && (
@@ -167,6 +171,7 @@ export const DebugPanel: React.FC<DebugPanelProps> = ({
               <div>Position: ({Math.round(localPlayer.position.x)}, {Math.round(localPlayer.position.y)}, {Math.round(localPlayer.position.z)})</div>
               <div>Health: {localPlayer.health}</div>
               <div>Current Animation: <span style={{color: '#ffcc00'}}>{localPlayer.currentAnimation || 'none'}</span></div>
+              <div>Current Tile: <span style={{color: '#4CAF50'}}>{localPlayer.currentTile || 'None'}</span></div>
             </div>
           )}
           
@@ -177,6 +182,7 @@ export const DebugPanel: React.FC<DebugPanelProps> = ({
                 <li key={player.identity.toHexString()}>
                   {player.username} ({player.characterClass}) - {player.identity.toHexString().substring(0, 8)}...
                   {player.currentAnimation && <span style={{color: '#a0e0ff'}}> [{player.currentAnimation}]</span>}
+                  {player.currentTile && <span style={{color: '#4CAF50'}}> | Tile: {player.currentTile}</span>}
                 </li>
               ))}
             </ul>

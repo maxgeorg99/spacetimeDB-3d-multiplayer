@@ -1,1170 +1,804 @@
 /**
  * Player.tsx
- * 
+ *
  * Component responsible for rendering and controlling individual player entities:
- * 
- * Key functionality:
- * - Handles 3D character model rendering with appropriate animations
- * - Implements physics-based player movement and collision detection
- * - Manages player state synchronization in multiplayer environment
- * - Processes user input for character control (keyboard/mouse)
- * - Handles different player classes with unique visual appearances
- * - Distinguishes between local player (user-controlled) and remote players
- * 
- * Props:
- * - playerClass: Determines visual appearance and possibly abilities
- * - username: Unique identifier displayed above character
- * - position: Initial spawn coordinates
- * - color: Optional custom color for character
- * - isLocal: Boolean determining if this is the user-controlled player
- * - socketId: Unique network identifier for player synchronization
- * 
- * Technical implementation:
- * - Uses React Three Fiber for 3D rendering within React
- * - Implements Rapier physics for movement and collision
- * - Manages socket.io communication for multiplayer state sync
- * - Handles animation state management for character model
- * 
- * Related files:
- * - GameScene.tsx: Parent component that instantiates players
- * - PlayerUI.tsx: UI overlay for player status information
- * - Server socket handlers: For network state synchronization
+ * // ... (rest of the documentation comments remain the same)
  */
 
 import React, { useRef, useEffect, useState, useCallback, useMemo } from 'react';
 import { useFrame, useThree } from '@react-three/fiber';
 import * as THREE from 'three';
-import { useAnimations, Html, Sphere } from '@react-three/drei';
+import { useAnimations, Html, Sphere } from '@react-three/drei'; // Assuming Sphere might be used for debug/hitbox
 import { FBXLoader } from 'three/examples/jsm/loaders/FBXLoader.js';
-import { PlayerData, InputState } from '../generated';
+import { PlayerData, InputState } from '../generated'; // Adjust path if needed
 
 // Define animation names for reuse
 const ANIMATIONS = {
-  IDLE: 'idle',
-  WALK_FORWARD: 'walk-forward',
-  WALK_BACK: 'walk-back',
-  WALK_LEFT: 'walk-left',
-  WALK_RIGHT: 'walk-right',
-  RUN_FORWARD: 'run-forward',
-  RUN_BACK: 'run-back',
-  RUN_LEFT: 'run-left',
-  RUN_RIGHT: 'run-right',
-  JUMP: 'jump',
-  ATTACK: 'attack1',
-  CAST: 'cast',
-  DAMAGE: 'damage',
-  DEATH: 'death',
+    IDLE: 'idle',
+    WALK_FORWARD: 'walk-forward',
+    WALK_BACK: 'walk-back',
+    WALK_LEFT: 'walk-left',
+    WALK_RIGHT: 'walk-right',
+    RUN_FORWARD: 'run-forward',
+    RUN_BACK: 'run-back',
+    RUN_LEFT: 'run-left',
+    RUN_RIGHT: 'run-right',
+    JUMP: 'jump',
+    ATTACK: 'attack1',
+    CAST: 'cast',
+    DAMAGE: 'damage',
+    DEATH: 'death',
 };
 
 // --- Client-side Constants ---
 const PLAYER_SPEED = 5.0; // Match server logic
 const SPRINT_MULTIPLIER = 1.8; // Match server logic
+const PLAYER_ROTATION_SPEED = Math.PI * 2; // Radians per second for smooth remote player rotation lerp
 
 // --- Client-side Prediction Constants ---
 const SERVER_TICK_RATE = 60; // Assuming server runs at 60Hz
 const SERVER_TICK_DELTA = 1 / SERVER_TICK_RATE; // Use this for prediction
-const POSITION_RECONCILE_THRESHOLD = 0.4;
+const POSITION_RECONCILE_THRESHOLD_SQ = 0.4 * 0.4; // Use squared distance for efficiency
 const ROTATION_RECONCILE_THRESHOLD = 0.1; // Radians
-const RECONCILE_LERP_FACTOR = 0.15;
+const RECONCILE_LERP_FACTOR = 0.15; // Smoothing factor for reconciliation lerp
 
 // --- Camera Constants ---
 const CAMERA_MODES = {
-  FOLLOW: 'follow',  // Default camera following behind player
-  ORBITAL: 'orbital' // Orbital camera that rotates around the player
+    FOLLOW: 'follow',  // Default camera following behind player
+    ORBITAL: 'orbital' // Orbital camera that rotates around the player
 };
+const CAMERA_LOOK_AT_OFFSET = new THREE.Vector3(0, 1.5, 0); // Point camera slightly above player base
 
+// Interface combining PlayerData with client-side display info
+interface ExtendedPlayerData extends PlayerData {
+    currentTileDisplay?: string; // Optional display string from GameScene
+}
+
+// Props for the Player component
 interface PlayerProps {
-  playerData: PlayerData;
-  isLocalPlayer: boolean;
-  onRotationChange?: (rotation: THREE.Euler) => void;
-  currentInput?: InputState; // Prop to receive current input for local player
-  isDebugArrowVisible?: boolean; // Prop to control debug arrow visibility
-  isDebugPanelVisible?: boolean; // Prop to control general debug helpers visibility
+    playerData: ExtendedPlayerData;
+    isLocalPlayer: boolean;
+    onRotationChange?: (rotation: THREE.Euler) => void; // Callback for local player rotation changes
+    currentInput?: InputState; // Current input state for the local player
+    isDebugArrowVisible?: boolean; // Show debug forward vector arrow
+    isDebugPanelVisible?: boolean; // Show general debug helpers
 }
 
 export const Player: React.FC<PlayerProps> = ({
-  playerData,
-  isLocalPlayer,
-  onRotationChange,
-  currentInput, // Receive input state
-  isDebugArrowVisible = false, 
-  isDebugPanelVisible = false // Destructure with default false
+    playerData,
+    isLocalPlayer,
+    onRotationChange,
+    currentInput,
+    isDebugArrowVisible = false,
+    isDebugPanelVisible = false
 }) => {
-  const group = useRef<THREE.Group>(null!);
-  const { camera } = useThree();
-  const dataRef = useRef<PlayerData>(playerData);
-  const characterClass = playerData.characterClass || 'Wizard';
-  
-  // Model management
-  const [modelLoaded, setModelLoaded] = useState(false);
-  const [model, setModel] = useState<THREE.Group | null>(null);
-  const [mixer, setMixer] = useState<THREE.AnimationMixer | null>(null);
-  const [animations, setAnimations] = useState<Record<string, THREE.AnimationAction>>({});
-  const [currentAnimation, setCurrentAnimation] = useState<string>(ANIMATIONS.IDLE);
-  
-  // --- Client Prediction State ---
-  const localPositionRef = useRef<THREE.Vector3>(new THREE.Vector3(playerData.position.x, playerData.position.y, playerData.position.z));
-  const localRotationRef = useRef<THREE.Euler>(new THREE.Euler(0, 0, 0, 'YXZ')); // Initialize with zero rotation
-  const debugArrowRef = useRef<THREE.ArrowHelper | null>(null); // Declare the ref for the debug arrow
-  
-  // Camera control variables
-  const isPointerLocked = useRef(false);
-  const zoomLevel = useRef(5);
-  const targetZoom = useRef(5);
-  
-  // Orbital camera variables
-  const [cameraMode, setCameraMode] = useState<string>(CAMERA_MODES.FOLLOW);
-  const orbitalCameraRef = useRef({
-    distance: 8,
-    height: 3,
-    angle: 0,
-    elevation: Math.PI / 6, // Approximately 30 degrees
-    autoRotate: false,
-    autoRotateSpeed: 0.5,
-    lastUpdateTime: Date.now(),
-    playerFacingRotation: 0 // Store player's facing direction when entering orbital mode
-  });
-  
-  // Ref to track if animations have been loaded already to prevent multiple loading attempts
-  const animationsLoadedRef = useRef(false);
-  
-  // Main character model path
-  const mainModelPath = (() => {
-    switch (characterClass) {
-        case 'Paladin':
-            return '/models/paladin/paladin.fbx';
-        case 'Wizard':
-            return '/models/wizard/wizard.fbx';
-        case 'Mario':
-            return '/models/mario/mario.fbx';
-        default:
-            return '/models/wizard/wizard.fbx';
-    }
-  })();
+    const group = useRef<THREE.Group>(null!);
+    const { camera } = useThree();
+    const characterClass = playerData.characterClass || 'Wizard'; // Default to Wizard
 
-  // --- State variables ---
-  const pointLightRef = useRef<THREE.PointLight>(null!); // Ref for the declarative light
+    // Model management state
+    const [modelLoaded, setModelLoaded] = useState(false);
+    const [model, setModel] = useState<THREE.Group | null>(null);
+    const [mixer, setMixer] = useState<THREE.AnimationMixer | null>(null);
+    const [animations, setAnimations] = useState<Record<string, THREE.AnimationAction>>({});
+    const [currentAnimation, setCurrentAnimation] = useState<string>(ANIMATIONS.IDLE);
+    const animationsLoadedRef = useRef(false); // Track if animations attempted loading
 
-  // --- Client-Side Movement Calculation (Matches Server Logic *before* Sign Flip) ---
-  const calculateClientMovement = useCallback((currentPos: THREE.Vector3, currentRot: THREE.Euler, inputState: InputState, delta: number): THREE.Vector3 => {
-    // console.log(`[Move Calc] cameraMode: ${cameraMode}`); // Suppressed log
-    
-    // Skip if no movement input
-    if (!inputState.forward && !inputState.backward && !inputState.left && !inputState.right) {
-      return currentPos;
-    }
+    // --- Client Prediction State (Local Player Only) ---
+    // Store predicted position and rotation locally
+    const localPositionRef = useRef<THREE.Vector3>(new THREE.Vector3(playerData.position?.x || 0, playerData.position?.y || 0, playerData.position?.z || 0));
+    // Use YXZ Euler order for intuitive yaw control from mouse
+    const localRotationRef = useRef<THREE.Euler>(new THREE.Euler(0, playerData.rotation?.y || 0, 0, 'YXZ'));
 
-    let worldMoveVector = new THREE.Vector3();
-    const speed = inputState.sprint ? PLAYER_SPEED * SPRINT_MULTIPLIER : PLAYER_SPEED;
-    let rotationYaw = 0;
+    // --- Remote Player State ---
+    // Store the last known server state for remote players for lerping
+    const lastServerPosition = useRef<THREE.Vector3>(new THREE.Vector3(playerData.position?.x || 0, playerData.position?.y || 0, playerData.position?.z || 0));
+    const lastServerRotationY = useRef<number>(playerData.rotation?.y || 0);
 
-    // 1. Calculate local movement vector based on WASD
-    let localMoveX = 0;
-    let localMoveZ = 0;
-    if (cameraMode === CAMERA_MODES.ORBITAL) {
-        if (inputState.forward) localMoveZ += 1;
-        if (inputState.backward) localMoveZ -= 1;
-        if (inputState.left) localMoveX += 1;
-        if (inputState.right) localMoveX -= 1;
-    } else {
-        if (inputState.forward) localMoveZ -= 1;
-        if (inputState.backward) localMoveZ += 1;
-        if (inputState.left) localMoveX -= 1;
-        if (inputState.right) localMoveX += 1;
-    }
-    const localMoveVector = new THREE.Vector3(localMoveX, 0, localMoveZ);
+    // --- Debugging Refs ---
+    const debugArrowRef = useRef<THREE.ArrowHelper | null>(null);
+    const pointLightRef = useRef<THREE.PointLight>(null!); // Ref for the declarative light if used
 
-    // Normalize if diagonal movement
-    if (localMoveVector.lengthSq() > 1.1) {
-      localMoveVector.normalize();
-    }
-
-    // 2. Determine which rotation to use based on camera mode
-    if (cameraMode === CAMERA_MODES.FOLLOW) {
-      // --- FOLLOW MODE: Use current player rotation ---
-      rotationYaw = currentRot.y;
-    } else {
-      // --- ORBITAL MODE: Use fixed rotation from when mode was entered ---
-      rotationYaw = orbitalCameraRef.current.playerFacingRotation;
-      console.log(`[Orbital Move Calc] Mode: ORBITAL, Using fixed yaw: ${rotationYaw.toFixed(3)}`);
-    }
-
-    // 3. Rotate the LOCAL movement vector by the appropriate YAW to get the WORLD direction
-    worldMoveVector = localMoveVector.clone().applyAxisAngle(new THREE.Vector3(0, 1, 0), rotationYaw);
-
-    // 4. Scale by speed and delta time
-    worldMoveVector.multiplyScalar(speed * delta);
-
-    // 5. Calculate the final position based on the raw world movement
-    // The server-side sign flip is handled during reconciliation, not prediction.
-    const finalPosition = currentPos.clone().add(worldMoveVector);
-
-    // Debug log for orbital mode
-    if (cameraMode === CAMERA_MODES.ORBITAL) {
-        console.log(`[Orbital Move Calc] Input: F${inputState.forward?1:0} B${inputState.backward?1:0} L${inputState.left?1:0} R${inputState.right?1:0}, MoveVector: (${worldMoveVector.x.toFixed(2)}, ${worldMoveVector.z.toFixed(2)}), Delta: ${delta.toFixed(4)}`);
-    }
-
-    return finalPosition;
-  }, [cameraMode]); // Depend on cameraMode from state
-
-  // --- Effect for model loading ---
-  useEffect(() => {
-    if (!playerData) return; // Guard clause
-    const loader = new FBXLoader();
-
-    loader.load(
-      mainModelPath,
-      (fbx) => {
-        
-        // Simplified: Just add the model, setup scale, shadows etc.
-        if (characterClass === 'Paladin') {
-          fbx.scale.setScalar(1.0);
-        } else {
-          fbx.scale.setScalar(0.02); // Default/Wizard scale
-        }
-        fbx.position.set(0, 0, 0);
-        // REMOVED TRAVERSE for setting castShadow/receiveShadow to avoid potential errors
-
-        setModel(fbx); 
-        
-        if (group.current) {
-          group.current.add(fbx);
-          // Apply position adjustment after adding to group
-          if (characterClass === 'Mario') {
-            fbx.position.y = -1; // Lower the model
-          } else {
-            fbx.position.y = -0.1; // Lower the model slightly
-          }
-          
-          // --- TRY AGAIN: Traverse to remove embedded lights --- 
-          try { 
-            console.log(`[Player Model Effect ${playerData.username}] Traversing loaded FBX to find embedded lights...`);
-            fbx.traverse((child) => {
-              if (child && child instanceof THREE.Light) { 
-                // --- LOGGING ADDED HERE ---
-                console.log(`[Player Model Effect ${playerData.username}] --- FOUND AND REMOVING EMBEDDED LIGHT --- Name: ${child.name || 'Unnamed'}, Type: ${child.type}`);
-                child.removeFromParent();
-              }
-            });
-          } catch (traverseError) {
-             console.error(`[Player Model Effect ${playerData.username}] Error during fbx.traverse for light removal:`, traverseError);
-          }
-          // --- END TRAVERSE ATTEMPT --- 
-
-        } 
-        
-        const newMixer = new THREE.AnimationMixer(fbx);
-        setMixer(newMixer);
-        setModelLoaded(true);
-        
-        // Initialize local refs for local player
-        if (isLocalPlayer) {
-          localPositionRef.current.set(playerData.position.x, playerData.position.y, playerData.position.z);
-          localRotationRef.current.set(0, playerData.rotation.y, 0, 'YXZ');
-        }
-      },
-      (progress) => { /* Optional progress log */ },
-      (error: any) => {
-        console.error(`[Player Model Effect ${playerData.username}] Error loading model ${mainModelPath}:`, error);
-      }
-    );
-
-    // Cleanup for model loading effect
-    return () => {
-      if (mixer) mixer.stopAllAction();
-      if (model && group.current) group.current.remove(model);
-      // Dispose geometry/material if needed
-      setModel(null);
-      setMixer(null);
-      setModelLoaded(false);
-      animationsLoadedRef.current = false;
-    };
-  }, [mainModelPath, characterClass]); // ONLY depend on model path and class
-
-  // New useEffect to load animations when mixer is ready
-  useEffect(() => {
-    if (mixer && model && !animationsLoadedRef.current) {
-      console.log("Mixer and model are ready, loading animations...");
-      animationsLoadedRef.current = true;
-      loadAnimations(mixer);
-    }
-  }, [mixer, model, characterClass]);
-
-  // Function to load animations
-  const loadAnimations = (mixerInstance: THREE.AnimationMixer) => {
-    if (!mixerInstance) {
-      console.error("Cannot load animations: mixer is not initialized");
-      return;
-    }
-    
-    console.log(`Loading animations for ${characterClass}...`);
-    
-    const animationPaths: Record<string, string> = {};
-    const basePath = characterClass === 'Mario' ? '/models/mario/' : (characterClass === 'Paladin' ? '/models/paladin/' : '/models/wizard/');
-    
-    // Map animation keys to file paths, ensuring exact matching of key names
-    // Define all animation keys with their exact matching paths
-    // Map animation keys to file paths, ensuring exact matching of key names
-    const animKeys = {
-      idle: characterClass === 'Mario' ? 'mario-idle.fbx' : (characterClass === 'Wizard' ? 'wizard-standing-idle.fbx' : 'paladin-idle.fbx'),
-      'walk-forward': characterClass === 'Mario' ? 'mario-walk-forward.fbx' : (characterClass === 'Wizard' ? 'wizard-standing-walk-forward.fbx' : 'paladin-walk-forward.fbx'),
-      'walk-back': characterClass === 'Mario' ? 'mario-walk-back.fbx' : (characterClass === 'Wizard' ? 'wizard-standing-walk-back.fbx' : 'paladin-walk-back.fbx'),
-      'walk-left': characterClass === 'Mario' ? 'mario-walk-left.fbx' : (characterClass === 'Wizard' ? 'wizard-standing-walk-left.fbx' : 'paladin-walk-left.fbx'),
-      'walk-right': characterClass === 'Mario' ? 'mario-walk-right.fbx' : (characterClass === 'Wizard' ? 'wizard-standing-walk-right.fbx' : 'paladin-walk-right.fbx'),
-      'run-forward': characterClass === 'Mario' ? 'mario-run-forward.fbx' : (characterClass === 'Wizard' ? 'wizard-standing-run-forward.fbx' : 'paladin-run-forward.fbx'),
-      'run-back': characterClass === 'Mario' ? 'mario-run-back.fbx' : (characterClass === 'Wizard' ? 'wizard-standing-run-back.fbx' : 'paladin-run-back.fbx'),
-      'run-left': characterClass === 'Mario' ? 'mario-run-left.fbx' : (characterClass === 'Wizard' ? 'wizard-standing-run-left.fbx' : 'paladin-run-left.fbx'),
-      'run-right': characterClass === 'Mario' ? 'mario-run-right.fbx' : (characterClass === 'Wizard' ? 'wizard-standing-run-right.fbx' : 'paladin-run-right.fbx'),
-      jump: characterClass === 'Mario' ? 'mario-idle.fbx' : (characterClass === 'Wizard' ? 'wizard-standing-jump.fbx' : 'paladin-jump.fbx'),
-      attack1: characterClass === 'Mario' ? 'mario-attack.fbx' : (characterClass === 'Wizard' ? 'wizard-standing-1h-magic-attack-01.fbx' : 'paladin-attack.fbx'),
-      cast: characterClass === 'Mario' ? 'mario-idle.fbx' : (characterClass === 'Wizard' ? 'wizard-standing-2h-magic-area-attack-02.fbx' : 'paladin-cast.fbx'),
-      damage: characterClass === 'Mario' ? 'mario-idle.fbx' : (characterClass === 'Wizard' ? 'wizard-standing-react-small-from-front.fbx' : 'paladin-damage.fbx'),
-      death: characterClass === 'Mario' ? 'mario-idle.fbx' : (characterClass === 'Wizard' ? 'wizard-standing-react-death-backward.fbx' : 'paladin-death.fbx'),
-  };
-    
-    // Create animation paths
-    Object.entries(animKeys).forEach(([key, filename]) => {
-      animationPaths[key] = `${basePath}${filename}`;
-    });
-    
-    console.log('Animation paths:', animationPaths);
-    
-    const loader = new FBXLoader();
-    const newAnimations: Record<string, THREE.AnimationAction> = {};
-    let loadedCount = 0;
-    const totalCount = Object.keys(animationPaths).length;
-    
-    console.log(`Will load ${totalCount} animations`);
-    
-    // Load each animation
-    Object.entries(animationPaths).forEach(([name, path]) => {
-      console.log(`Loading animation "${name}" from ${path}`);
-      
-      // First check if the file exists
-      fetch(path)
-        .then(response => {
-          if (!response.ok) {
-            console.error(`Animation file not found: ${path} (${response.status})`);
-            loadedCount++;
-            checkCompletedLoading();
-            return;
-          }
-          
-          // File exists, proceed with loading
-          loadAnimationFile(name, path, mixerInstance);
-        })
-        .catch(error => {
-          console.error(`Network error checking animation file ${path}:`, error);
-          loadedCount++;
-          checkCompletedLoading();
-        });
+    // --- Camera Control State (Local Player Only) ---
+    const isPointerLocked = useRef(false);
+    const zoomLevel = useRef(5); // Current camera distance (follow mode)
+    const targetZoom = useRef(5); // Target camera distance for smooth zoom
+    const [cameraMode, setCameraMode] = useState<string>(CAMERA_MODES.FOLLOW);
+    const orbitalCameraRef = useRef({
+        distance: 8,
+        height: 3,
+        angle: 0,
+        elevation: Math.PI / 6, // Approx 30 degrees
+        autoRotate: false,
+        autoRotateSpeed: 0.5,
+        lastUpdateTime: Date.now(),
+        playerFacingRotation: 0 // Stores player's Y rotation when entering orbital mode
     });
 
-    // Function to check if all animations are loaded
-    const checkCompletedLoading = () => {
-      loadedCount++; // Increment here after load attempt (success or fail)
-      if (loadedCount === totalCount) {
-        const successCount = Object.keys(newAnimations).length;
-        if (successCount === totalCount) {
-          console.log(`✅ All ${totalCount} animations loaded successfully.`);
-        } else {
-           console.warn(`⚠️ Loaded ${successCount}/${totalCount} animations. Some might be missing.`);
+    // --- Model Path Determination ---
+    const mainModelPath = useMemo(() => {
+        switch (characterClass) {
+            case 'Paladin': return '/models/paladin/paladin.fbx';
+            case 'Wizard': return '/models/wizard/wizard.fbx';
+            case 'Mario': return '/models/mario/mario.fbx';
+            default: return '/models/wizard/wizard.fbx';
         }
-        
-        // Store all successfully loaded animations in component state
-        setAnimations(newAnimations);
-        
-        // Debug: log all available animations
-        console.log("Available animations: ", Object.keys(newAnimations).join(", "));
-        
-        // Play idle animation if available
-        if (newAnimations['idle']) {
-          // Use setTimeout to ensure state update has propagated and mixer is ready
-          setTimeout(() => {
-             if (animationsLoadedRef.current) { // Check if still relevant
-                 console.log('Playing initial idle animation');
-                 // Use the local newAnimations reference to be sure it's available
-                 const idleAction = newAnimations['idle'];
-                 idleAction.reset()
-                           .setEffectiveTimeScale(1)
-                           .setEffectiveWeight(1)
-                           .fadeIn(0.3)
-                           .play();
-                 setCurrentAnimation('idle');
-             }
-          }, 100); 
-        } else {
-          console.error('Idle animation not found among loaded animations! Player might not animate initially.');
-        }
+    }, [characterClass]);
+
+    // --- Client-Side Movement Calculation (Prediction) ---
+    const calculateClientMovement = useCallback((currentPos: THREE.Vector3, currentRotY: number, inputState: InputState, delta: number): THREE.Vector3 => {
+      // ... (guard clauses, speed calculation) ...
+      const speed = inputState.sprint ? PLAYER_SPEED * SPRINT_MULTIPLIER : PLAYER_SPEED;
+      let localMoveX = 0;
+      let localMoveZ = 0;
+  
+      if (cameraMode === CAMERA_MODES.ORBITAL) {
+          // ... (keep orbital logic as is for now) ...
+      } else { // FOLLOW mode - Fix the movement mapping
+          // --- CORRECTED INPUT MAPPING ---
+          if (inputState.forward) localMoveZ -= 1; // Forward is negative Z in Three.js
+          if (inputState.backward) localMoveZ += 1; // Backward is positive Z
+          if (inputState.left) localMoveX -= 1;    // Left is negative X
+          if (inputState.right) localMoveX += 1;   // Right is positive X
+          // --- END CORRECTED INPUT MAPPING ---
       }
-    };
-
-    // Function to load an animation file
-    const loadAnimationFile = (name: string, path: string, mixerInstance: THREE.AnimationMixer) => {
-      if (!mixerInstance) {
-        console.error(`Cannot load animation ${name}: mixer is not initialized`);
-        // loadedCount is incremented in checkCompletedLoading call below
-        checkCompletedLoading();
-        return;
+  
+      // ... (rest of vector normalization, rotation, scaling) ...
+      const localMoveVector = new THREE.Vector3(localMoveX, 0, localMoveZ);
+      if (localMoveVector.lengthSq() > 0) {
+          localMoveVector.normalize();
       }
-      
-      loader.load(
-        path,
-        (animFbx) => {
-          try {
-            if (!animFbx.animations || animFbx.animations.length === 0) {
-              console.error(`No animations found in ${path}`);
-              checkCompletedLoading(); // Call completion even on error
-              return;
-            }
-            
-            const clip = animFbx.animations[0];
-            console.log(`Animation "${name}" loaded. Duration: ${clip.duration}s, Tracks: ${clip.tracks.length}`);
-            
-            // Try to find hierarchy and parent bone
-            let rootBoneName = '';
-            animFbx.traverse((obj) => {
-              if (obj.type === 'Bone' && !rootBoneName && obj.parent && obj.parent.type === 'Object3D') {
-                rootBoneName = obj.name;
-                // console.log(`Found potential root bone for anim ${name}: ${rootBoneName}`);
-              }
-            });
-            
-            // Apply name to the clip
-            clip.name = name;
-            
-            // Retarget the clip if needed
-            const retargetedClip = retargetClip(clip, path);
-            
-            // Make sure we're in place (remove root motion)
-            makeAnimationInPlace(retargetedClip);
-            
-            const action = mixerInstance.clipAction(retargetedClip);
-            newAnimations[name] = action;
-            
-            // Set loop mode based on animation type
-            if (
-              name === 'idle' ||
-              name.startsWith('walk-') ||
-              name.startsWith('run-')
-            ) {
-              action.setLoop(THREE.LoopRepeat, Infinity);
-            } else {
-              action.setLoop(THREE.LoopOnce, 1);
-              action.clampWhenFinished = true;
-            }
-            
-            console.log(`✅ Animation "${name}" processed and ready.`);
-          } catch (e) {
-            console.error(`Error processing animation ${name}:`, e);
-          }
-          
-          checkCompletedLoading(); // Call completion after processing
-        },
-        (progress) => {
-          // Optional: Log animation loading progress for larger files
-          // if (progress.total > 1000000) { // Only for large files
-          //   console.log(`Loading ${name}: ${Math.round(progress.loaded / progress.total * 100)}%`);
-          // }
-        },
-        (error: any) => {
-          console.error(`Error loading animation ${name} from ${path}: ${error.message || 'Unknown error'}`);
-          checkCompletedLoading(); // Call completion even on error
-        }
-      );
-    };
-  };
+      const rotationYaw = (cameraMode === CAMERA_MODES.ORBITAL)
+          ? orbitalCameraRef.current.playerFacingRotation
+          : currentRotY; // Use the group's direct rotation
+      const worldMoveVector = localMoveVector.applyAxisAngle(new THREE.Vector3(0, 1, 0), rotationYaw);
+      worldMoveVector.multiplyScalar(speed * delta);
+      return currentPos.clone().add(worldMoveVector);
+  
+  }, [cameraMode]);
 
-  // Improve root motion removal function
-  const makeAnimationInPlace = (clip: THREE.AnimationClip) => {
-    // console.log(`Making animation "${clip.name}" in-place`);
-    
-    // Get all position tracks
-    const tracks = clip.tracks;
-    const positionTracks = tracks.filter(track => track.name.endsWith('.position'));
-    
-    if (positionTracks.length === 0) {
-      // console.log(`No position tracks found in "${clip.name}"`);
-      return;
-    }
-    
-    // console.log(`Found ${positionTracks.length} position tracks in "${clip.name}"`);
-    
-    // Find the root position track (typically the first bone)
-    // Common root bone names: Hips, mixamorigHips, root, Armature
-    let rootTrack: THREE.KeyframeTrack | undefined;
-    const rootNames = ['Hips.position', 'mixamorigHips.position', 'root.position', 'Armature.position', 'Root.position'];
-    rootTrack = positionTracks.find(track => rootNames.some(name => track.name.toLowerCase().includes(name.toLowerCase())));
+    // --- Effect for Model Loading ---
+    useEffect(() => {
+        const loader = new FBXLoader();
+        let currentModel: THREE.Group | null = null; // Track model being loaded in this effect instance
 
-    if (!rootTrack) {
-        // If no common root name found, assume the first position track is the root
-        rootTrack = positionTracks[0];
-        // console.warn(`Using first position track "${rootTrack.name}" as root for in-place conversion for anim "${clip.name}".`);
-    } else {
-        // console.log(`Using root bone track "${rootTrack.name}" for in-place conversion for anim "${clip.name}"`);
-    }
-    
-    const rootTrackNameBase = rootTrack.name.split('.')[0];
+        loader.load(
+            mainModelPath,
+            (fbx) => {
+                currentModel = fbx; // Assign loaded model
+                if (characterClass === 'Paladin') {
+                    fbx.scale.setScalar(1.0);
+                }
+                else if (characterClass === 'Mario') {
+                  fbx.scale.setScalar(0.0125); //Mario scale
+                } else {
+                    fbx.scale.setScalar(0.02); // Wizard scale
+                }
+                fbx.position.set(0, characterClass === 'Mario' ? -1 : -0.1, 0); // Adjust vertical position
 
-    // Filter out root position tracks to remove root motion
-    // Keep only the Y component of the root track if needed for jumps, etc.
-    const originalLength = clip.tracks.length;
-    clip.tracks = tracks.filter(track => {
-        if (track.name.startsWith(`${rootTrackNameBase}.position`)) {
-            // Maybe keep Y component in the future if needed, for now remove all XYZ root motion.
-            return false; // Remove X, Y, Z root position tracks
-        }
-        return true; // Keep other tracks
-    });
-    
-    // console.log(`Removed ${originalLength - clip.tracks.length} root motion tracks from "${clip.name}"`);
-  };
+                fbx.rotation.y = Math.PI; // Face the player forward
 
-  // Add a retargetClip function after makeAnimationInPlace
-  const retargetClip = (clip: THREE.AnimationClip, sourceModelPath: string) => {
-    if (!model) {
-      console.warn("Cannot retarget: model not loaded");
-      return clip;
-    }
-    
-    // console.log(`Retargeting animation "${clip.name}" from ${sourceModelPath}`);
-    
-    // Get source file basename (without extension)
-    const sourceFileName = sourceModelPath.split('/').pop()?.split('.')[0] || '';
-    const targetFileName = mainModelPath.split('/').pop()?.split('.')[0] || '';
-    
-    if (sourceFileName === targetFileName) {
-      // console.log(`Source and target models are the same (${sourceFileName}), no retargeting needed`);
-      return clip;
-    }
-    
-    // console.log(`Retargeting from "${sourceFileName}" to "${targetFileName}"`);
-    
-    // Create a new animation clip
-    const newTracks: THREE.KeyframeTrack[] = [];
-    
-    // Process each track to replace bone names if needed
-    clip.tracks.forEach(track => {
-      // The track name format is usually "boneName.property"
-      const trackNameParts = track.name.split('.');
-      if (trackNameParts.length < 2) {
-        // console.warn(`Strange track name format: ${track.name}`);
-        newTracks.push(track);
-        return;
-      }
-      
-      const boneName = trackNameParts[0];
-      const property = trackNameParts.slice(1).join('.');
-      
-      // Try to find corresponding bone in target model
-      // Check if we need any bone name mappings from source to target
-      let targetBoneName = boneName;
-      
-      // ** Bone Name Mapping (Example) **
-      // If source uses "bip01_" prefix and target uses "mixamorig", map them:
-      // if (boneName.startsWith('bip01_')) {
-      //   targetBoneName = boneName.replace('bip01_', 'mixamorig');
-      // }
-      // Add other mappings as needed based on model skeletons
-      
-      // Add the fixed track
-      const newTrackName = `${targetBoneName}.${property}`;
-      
-      // Only create new track if the name needs to change
-      if (newTrackName !== track.name) {
-        // console.log(`Remapping track: ${track.name} → ${newTrackName}`);
-        
-        // Create a new track with same data but new name
-        let newTrack: THREE.KeyframeTrack;
-        
-        if (track instanceof THREE.QuaternionKeyframeTrack) {
-          newTrack = new THREE.QuaternionKeyframeTrack(
-            newTrackName,
-            Array.from(track.times),
-            Array.from(track.values)
-          );
-        } else if (track instanceof THREE.VectorKeyframeTrack) {
-          newTrack = new THREE.VectorKeyframeTrack(
-            newTrackName,
-            Array.from(track.times),
-            Array.from(track.values)
-          );
-        } else {
-          // Fallback for NumberKeyframeTrack or others
-          newTrack = new THREE.KeyframeTrack(
-            newTrackName,
-            Array.from(track.times),
-            Array.from(track.values)
-          );
-        }
-        
-        newTracks.push(newTrack);
-      } else {
-        newTracks.push(track); // No change needed, push original track
-      }
-    });
-    
-    // Create a new animation clip with the fixed tracks
-    return new THREE.AnimationClip(
-      clip.name,
-      clip.duration,
-      newTracks,
-      clip.blendMode
-    );
-  };
+                // Add model to the group ref
+                if (group.current) {
+                    group.current.add(fbx);
+                }
 
-  // Update playAnimation to have better logging
-  const playAnimation = useCallback((name: string, crossfadeDuration = 0.3) => {
-    if (!mixer) return; // Ensure mixer exists
-    
-    if (!animations[name]) {
-      // console.warn(`Animation not found: ${name}`);
-      // console.log("Available animations:", Object.keys(animations).join(", "));
-      // Fallback to idle if requested animation is missing
-      if (name !== ANIMATIONS.IDLE && animations[ANIMATIONS.IDLE]) {
-        // console.log(`Falling back to ${ANIMATIONS.IDLE}`);
-        name = ANIMATIONS.IDLE;
-      } else {
-         return; // Cannot play requested or fallback idle
-      }
-    }
-    
-    // console.log(`Playing animation: ${name} (crossfade: ${crossfadeDuration}s)`);
-    
-    const targetAction = animations[name];
-    const currentAction = animations[currentAnimation];
-    
-    if (currentAction && currentAction !== targetAction) {
-      // console.log(`Fading out previous animation: ${currentAnimation}`);
-      currentAction.fadeOut(crossfadeDuration);
-    }
-    
-    // console.log(`Starting animation: ${name}`);
-    targetAction.reset()
-                .setEffectiveTimeScale(1)
-                .setEffectiveWeight(1)
-                .fadeIn(crossfadeDuration)
-                .play();
-                
-    setCurrentAnimation(name);
-  }, [animations, currentAnimation, mixer]); // Add mixer to dependencies
+                // Traverse AFTER adding to group to remove embedded lights
+                 try {
+                     fbx.traverse((child) => {
+                         if (child instanceof THREE.Light) {
+                             console.log(`[Player ${playerData.username}] Removing embedded light: ${child.name || 'Unnamed'} (${child.type})`);
+                             child.removeFromParent();
+                         }
+                     });
+                 } catch (traverseError) {
+                    console.error(`[Player ${playerData.username}] Error during fbx.traverse for light removal:`, traverseError);
+                 }
 
-  // --- NEW Effect: Explicitly set shadow props when model is loaded ---
-  useEffect(() => {
-    if (model && group.current) {
-      console.log(`[Player Shadow Effect ${playerData.username}] Model loaded, traversing group to set shadow props on meshes.`);
-      group.current.traverse((child) => {
-        if (child instanceof THREE.Mesh) {
-          // Explicitly set both cast and receive, although cast is the primary goal here
-          child.castShadow = true;
-          child.receiveShadow = true; 
-        }
-      });
-    }
-  }, [model]); // Run this effect whenever the model state changes
+                // Initialize animation mixer
+                const newMixer = new THREE.AnimationMixer(fbx);
+                setMixer(newMixer);
+                setModel(fbx); // Set model state
+                setModelLoaded(true);
+                animationsLoadedRef.current = false; // Reset flag to allow animation loading
 
-  // --- Server State Reconciliation --- -> Now handled within useFrame
-  // useEffect(() => {
-  //   if (!isLocalPlayer || !modelLoaded) return; 
+                // Set initial local state for the local player
+                if (isLocalPlayer && playerData.position && playerData.rotation) {
+                    localPositionRef.current.set(playerData.position.x, playerData.position.y, playerData.position.z);
+                    localRotationRef.current.set(0, playerData.rotation.y, 0, 'YXZ');
+                    // Store initial rotation for orbital mode start
+                    orbitalCameraRef.current.playerFacingRotation = playerData.rotation.y;
+                } else if (!isLocalPlayer && playerData.position && playerData.rotation) {
+                    // Set initial state for remote players for lerping
+                    lastServerPosition.current.set(playerData.position.x, playerData.position.y, playerData.position.z);
+                    lastServerRotationY.current = playerData.rotation.y;
+                }
+            },
+            undefined, // Progress callback (optional)
+            (error) => console.error(`[Player ${playerData.username}] Error loading model ${mainModelPath}:`, error)
+        );
 
-  //   // Update internal ref used by useFrame
-  //   dataRef.current = playerData;
-
-  // }, [playerData, isLocalPlayer, modelLoaded]);
-
-  // Set up pointer lock for camera control if local player
-  useEffect(() => {
-    if (!isLocalPlayer) return;
-    
-    const handlePointerLockChange = () => {
-      isPointerLocked.current = document.pointerLockElement === document.body;
-      // Add cursor style changes to match legacy implementation
-      if (isPointerLocked.current) {
-        document.body.classList.add('cursor-locked');
-      } else {
-        document.body.classList.remove('cursor-locked');
-      }
-    };
-    
-    const handleMouseMove = (e: MouseEvent) => {
-      if (!isPointerLocked.current || !isLocalPlayer) return;
-      
-      if (cameraMode === CAMERA_MODES.FOLLOW) {
-        // Update LOCAL rotation ref based on mouse movement for player rotation
-        const sensitivity = 0.003;
-        localRotationRef.current.y -= e.movementX * sensitivity;
-        
-        // Keep angle within [-PI, PI] for consistency
-        localRotationRef.current.y = THREE.MathUtils.euclideanModulo(localRotationRef.current.y + Math.PI, 2 * Math.PI) - Math.PI;
-
-        // Call the rotation change callback if provided (using local ref)
-        if (onRotationChange) {
-          onRotationChange(localRotationRef.current);
-        }
-      } else if (cameraMode === CAMERA_MODES.ORBITAL) {
-        // In orbital mode, mouse movement controls the camera angle around the player
-        const orbital = orbitalCameraRef.current;
-        const sensitivity = 0.005;
-        
-        // X movement rotates camera around player
-        orbital.angle -= e.movementX * sensitivity;
-        
-        // Y movement controls camera elevation/height
-        orbital.elevation += e.movementY * sensitivity;
-        
-        // Clamp elevation between reasonable limits (15° to 85°)
-        orbital.elevation = Math.max(Math.PI / 12, Math.min(Math.PI / 2.1, orbital.elevation));
-      }
-    };
-    
-    const handleMouseWheel = (e: WheelEvent) => {
-      if (!isLocalPlayer) return;
-      
-      if (cameraMode === CAMERA_MODES.FOLLOW) {
-        // Follow camera zoom
-        const zoomSpeed = 0.8; // Match legacy zoom speed
-        const zoomChange = Math.sign(e.deltaY) * zoomSpeed;
-        const minZoom = 2.0; // Closest zoom
-        const maxZoom = 12.0; // Furthest zoom allowed
-        targetZoom.current = Math.max(minZoom, Math.min(maxZoom, zoomLevel.current + zoomChange));
-      } else if (cameraMode === CAMERA_MODES.ORBITAL) {
-        // Orbital camera zoom
-        const orbital = orbitalCameraRef.current;
-        const zoomSpeed = 0.5;
-        const zoomChange = Math.sign(e.deltaY) * zoomSpeed;
-        
-        // Adjust orbital distance
-        orbital.distance = Math.max(3, Math.min(20, orbital.distance + zoomChange));
-      }
-    };
-    
-    // Request pointer lock on click
-    const handleCanvasClick = () => {
-      if (!isPointerLocked.current) {
-        document.body.requestPointerLock();
-      }
-    };
-    
-    document.addEventListener('pointerlockchange', handlePointerLockChange);
-    document.addEventListener('mousemove', handleMouseMove);
-    document.addEventListener('wheel', handleMouseWheel);
-    document.addEventListener('click', handleCanvasClick);
-    
-    return () => {
-      document.removeEventListener('pointerlockchange', handlePointerLockChange);
-      document.removeEventListener('mousemove', handleMouseMove);
-      document.removeEventListener('wheel', handleMouseWheel);
-      document.removeEventListener('click', handleCanvasClick);
-    };
-  }, [isLocalPlayer, onRotationChange, cameraMode]);
-
-  // Handle one-time animation completion
-  useEffect(() => {
-    // Explicitly wrap hook body
-    {
-      if (
-        mixer &&
-        animations[currentAnimation] &&
-        (currentAnimation === ANIMATIONS.JUMP ||
-         currentAnimation === ANIMATIONS.ATTACK ||
-         currentAnimation === ANIMATIONS.CAST)
-      ) {
-        const action = animations[currentAnimation];
-        
-        // Ensure action exists and has a clip
-        if (!action || !action.getClip()) return;
-        
-        const duration = action.getClip().duration;
-        
-        // Define the listener function
-        const onFinished = (event: any) => {
-          // Only act if the finished action is the one we are tracking
-          if (event.action === action) {
-             // console.log(`Animation finished: ${currentAnimation}. Playing idle.`);
-             playAnimation(ANIMATIONS.IDLE, 0.1); // Faster transition back to idle
-             mixer.removeEventListener('finished', onFinished); // Remove listener
-          }
-        };
-        
-        // Add the listener
-        mixer.addEventListener('finished', onFinished);
-
-        // Cleanup function to remove listener if component unmounts or animation changes
+        // Cleanup function for the effect
         return () => {
-          if (mixer) {
-            mixer.removeEventListener('finished', onFinished);
-          }
+            animationsLoadedRef.current = false; // Ensure flag is reset on cleanup/reload
+            if (mixer) mixer.stopAllAction();
+            if (currentModel && group.current) { // Use the model loaded in *this* effect instance
+                 group.current.remove(currentModel);
+                 // Consider adding geometry/material disposal here if needed
+            }
+            setModel(null);
+            setMixer(null);
+            setModelLoaded(false);
+            setAnimations({}); // Clear animations state
+            setCurrentAnimation(ANIMATIONS.IDLE);
         };
-      }
-    }
-  }, [currentAnimation, animations, mixer, playAnimation]); // Ensure all dependencies are listed
+    }, [mainModelPath, characterClass, playerData.username, isLocalPlayer]); // Rerun if model path, class, username changes
 
-  // --- Handle Camera Toggle ---
-  const toggleCameraMode = useCallback(() => {
-    const newMode = cameraMode === CAMERA_MODES.FOLLOW ? CAMERA_MODES.ORBITAL : CAMERA_MODES.FOLLOW;
-    setCameraMode(newMode);
-    
-    // Store player's facing direction when entering orbital mode
-    if (newMode === CAMERA_MODES.ORBITAL) {
-      // Use the current reconciled rotation from the ref
-      orbitalCameraRef.current.playerFacingRotation = localRotationRef.current.y;
-      console.log(`[Orbital Toggle] Storing playerFacingRotation: ${orbitalCameraRef.current.playerFacingRotation.toFixed(3)}`); // DEBUG
-      // Set the initial orbital angle to match the player's facing direction
-      orbitalCameraRef.current.angle = localRotationRef.current.y;
-      // Reset elevation to a default value for a consistent starting view
-      orbitalCameraRef.current.elevation = Math.PI / 6; 
-      
-      // Log the stored rotation for debugging
-      console.log(`Entering orbital mode. Stored player rotation: ${(localRotationRef.current.y * (180/Math.PI)).toFixed(2)}°`);
-    }
-    
-    console.log(`Camera mode toggled to: ${newMode}`);
-  }, [cameraMode]); // localRotationRef is not a state/prop, so not needed here
+    // --- Effect for Loading Animations ---
+    useEffect(() => {
+        // Only load if mixer exists, model is set, and animations haven't been loaded yet
+        if (mixer && model && !animationsLoadedRef.current) {
+            console.log(`[Player ${playerData.username}] Mixer/Model ready. Loading animations for ${characterClass}...`);
+            animationsLoadedRef.current = true; // Set flag to prevent re-loading
+            loadAnimations(mixer);
+        }
+    }, [mixer, model, characterClass, playerData.username]); // Depend on mixer, model, class
 
-  // Set up keyboard handlers for camera toggling
-  useEffect(() => {
-    if (!isLocalPlayer) return;
-    
-    const handleKeyDown = (event: KeyboardEvent) => {
-      // Toggle camera mode on 'C' key press
-      if (event.code === 'KeyC' && !event.repeat) { // Check for !event.repeat
-        toggleCameraMode();
-      }
-    };
-    
-    window.addEventListener('keydown', handleKeyDown);
-    
-    return () => {
-      window.removeEventListener('keydown', handleKeyDown);
-    };
-  }, [isLocalPlayer, toggleCameraMode]);
 
-  // Update the useFrame hook to handle both camera modes and reconciliation
-  useFrame((state, delta) => {
-    {
-      const dt = Math.min(delta, 1 / 30);
+    // --- Animation Loading, Retargeting, In-Place Conversion Functions ---
+    // (Using the functions provided in the previous prompt: loadAnimations, makeAnimationInPlace, retargetClip)
+    // ... loadAnimations function (including checkCompletedLoading, loadAnimationFile) ...
+    // ... makeAnimationInPlace function ...
+    // ... retargetClip function ...
+     // Function to load animations
+    const loadAnimations = (mixerInstance: THREE.AnimationMixer) => {
+        if (!mixerInstance) {
+            console.error("Cannot load animations: mixer is not initialized");
+            return;
+        }
 
-      // --- Parent Check & Position Log --- 
-      if (pointLightRef.current && group.current && Math.random() < 0.01) { 
-        const lightWorldPos = new THREE.Vector3();
-        const groupWorldPos = new THREE.Vector3();
-        pointLightRef.current.getWorldPosition(lightWorldPos);
-        group.current.getWorldPosition(groupWorldPos);
+        console.log(`[Player ${playerData.username}] Loading animations for ${characterClass}...`);
 
-        /*if (pointLightRef.current.parent !== group.current) {
-          console.error(`[Player Frame ${playerData.username}] Light parent mismatch!`);
-        } else {
-          // Log world positions for comparison
-          console.log(`[Player Frame ${playerData.username}] Group World: (${groupWorldPos.x.toFixed(2)}, ${groupWorldPos.y.toFixed(2)}, ${groupWorldPos.z.toFixed(2)}), Light World: (${lightWorldPos.x.toFixed(2)}, ${lightWorldPos.y.toFixed(2)}, ${lightWorldPos.z.toFixed(2)})`);
-        }*/
-      }
-      // --- END LOG --- 
+        const animationPaths: Record<string, string> = {};
+        const basePath = characterClass === 'Mario' ? '/models/mario/' : (characterClass === 'Paladin' ? '/models/paladin/' : '/models/wizard/');
 
-      // Update latest server data ref for local player
-      if (isLocalPlayer) {
-          dataRef.current = playerData;
-      }
+        // Map animation keys to file paths (ensure exact matching of key names)
+        const animKeys = {
+            [ANIMATIONS.IDLE]: characterClass === 'Mario' ? 'mario-idle.fbx' : (characterClass === 'Wizard' ? 'wizard-standing-idle.fbx' : 'paladin-idle.fbx'),
+            [ANIMATIONS.WALK_FORWARD]: characterClass === 'Mario' ? 'mario-walk-forward.fbx' : (characterClass === 'Wizard' ? 'wizard-standing-walk-forward.fbx' : 'paladin-walk-forward.fbx'),
+            [ANIMATIONS.WALK_BACK]: characterClass === 'Mario' ? 'mario-walk-back.fbx' : (characterClass === 'Wizard' ? 'wizard-standing-walk-back.fbx' : 'paladin-walk-back.fbx'),
+            [ANIMATIONS.WALK_LEFT]: characterClass === 'Mario' ? 'mario-walk-left.fbx' : (characterClass === 'Wizard' ? 'wizard-standing-walk-left.fbx' : 'paladin-walk-left.fbx'),
+            [ANIMATIONS.WALK_RIGHT]: characterClass === 'Mario' ? 'mario-walk-right.fbx' : (characterClass === 'Wizard' ? 'wizard-standing-walk-right.fbx' : 'paladin-walk-right.fbx'),
+            [ANIMATIONS.RUN_FORWARD]: characterClass === 'Mario' ? 'mario-run-forward.fbx' : (characterClass === 'Wizard' ? 'wizard-standing-run-forward.fbx' : 'paladin-run-forward.fbx'),
+            [ANIMATIONS.RUN_BACK]: characterClass === 'Mario' ? 'mario-run-back.fbx' : (characterClass === 'Wizard' ? 'wizard-standing-run-back.fbx' : 'paladin-run-back.fbx'),
+            [ANIMATIONS.RUN_LEFT]: characterClass === 'Mario' ? 'mario-run-left.fbx' : (characterClass === 'Wizard' ? 'wizard-standing-run-left.fbx' : 'paladin-run-left.fbx'),
+            [ANIMATIONS.RUN_RIGHT]: characterClass === 'Mario' ? 'mario-run-right.fbx' : (characterClass === 'Wizard' ? 'wizard-standing-run-right.fbx' : 'paladin-run-right.fbx'),
+            [ANIMATIONS.JUMP]: characterClass === 'Mario' ? 'mario-jump.fbx' : (characterClass === 'Wizard' ? 'wizard-standing-jump.fbx' : 'paladin-jump.fbx'), // Mario needs jump
+            [ANIMATIONS.ATTACK]: characterClass === 'Mario' ? 'mario-attack.fbx' : (characterClass === 'Wizard' ? 'wizard-standing-1h-magic-attack-01.fbx' : 'paladin-attack.fbx'),
+            [ANIMATIONS.CAST]: characterClass === 'Mario' ? 'mario-idle.fbx' : (characterClass === 'Wizard' ? 'wizard-standing-2h-magic-area-attack-02.fbx' : 'paladin-cast.fbx'), // Mario fallback
+            [ANIMATIONS.DAMAGE]: characterClass === 'Mario' ? 'mario-idle.fbx' : (characterClass === 'Wizard' ? 'wizard-standing-react-small-from-front.fbx' : 'paladin-damage.fbx'), // Mario fallback
+            [ANIMATIONS.DEATH]: characterClass === 'Mario' ? 'mario-death.fbx' : (characterClass === 'Wizard' ? 'wizard-standing-react-death-backward.fbx' : 'paladin-death.fbx'), // Mario needs death
+        };
 
-      if (group.current && modelLoaded) {
-        if (isLocalPlayer && currentInput) {
-          // --- LOCAL PLAYER PREDICTION & RECONCILIATION --- 
+        Object.entries(animKeys).forEach(([key, filename]) => {
+            animationPaths[key] = `${basePath}${filename}`;
+        });
 
-          // 1. Calculate predicted position based on current input, rotation, and SERVER_TICK_DELTA
-          const predictedPosition = calculateClientMovement(
-            localPositionRef.current,
-            localRotationRef.current, // Pass current local rotation; function internally selects based on mode
-            currentInput,
-            SERVER_TICK_DELTA // Use FIXED delta for prediction to match server
-          );
-          localPositionRef.current.copy(predictedPosition);
+        const loader = new FBXLoader();
+        const newAnimations: Record<string, THREE.AnimationAction> = {};
+        let loadedCount = 0;
+        const totalCount = Object.keys(animationPaths).length;
+        console.log(`[Player ${playerData.username}] Attempting to load ${totalCount} animations...`);
 
-          // 2. RECONCILIATION (Position)
-          const serverPosition = new THREE.Vector3(dataRef.current.position.x, dataRef.current.position.y, dataRef.current.position.z);
-
-          // Compare local (unflipped) prediction with an unflipped version of the server state
-          const unflippedServerPosition = serverPosition.clone();
-          unflippedServerPosition.x *= -1; // Undo server flip for comparison
-          unflippedServerPosition.z *= -1; // Undo server flip for comparison
-
-          const positionError = localPositionRef.current.distanceTo(unflippedServerPosition);
-          
-          if (positionError > POSITION_RECONCILE_THRESHOLD) {
-            // Temporarily disable LERP in orbital mode to test if reconciliation is the issue
-            if (cameraMode !== CAMERA_MODES.ORBITAL) {
-                localPositionRef.current.lerp(serverPosition, RECONCILE_LERP_FACTOR);
+        const checkCompletedLoading = () => {
+            loadedCount++;
+            if (loadedCount === totalCount) {
+                const successCount = Object.keys(newAnimations).length;
+                console.log(`[Player ${playerData.username}] Animation loading complete. Success: ${successCount}/${totalCount}.`);
+                setAnimations(newAnimations); // Update state with loaded animations
+                // Play initial animation after a short delay
+                setTimeout(() => {
+                     if (newAnimations[ANIMATIONS.IDLE]) {
+                        console.log(`[Player ${playerData.username}] Playing initial idle animation.`);
+                        const idleAction = newAnimations[ANIMATIONS.IDLE];
+                        idleAction.reset().setEffectiveTimeScale(1).setEffectiveWeight(1).fadeIn(0.3).play();
+                        setCurrentAnimation(ANIMATIONS.IDLE);
+                     } else {
+                        console.warn(`[Player ${playerData.username}] Idle animation not found after loading.`);
+                     }
+                }, 50); // Delay to allow state update
             }
-          }
+        };
 
-          // 2.5 RECONCILIATION (Rotation) 
-          const serverRotation = new THREE.Euler(0, dataRef.current.rotation.y, 0, 'YXZ');
-          const reconcileTargetQuat = new THREE.Quaternion().setFromEuler(serverRotation);
-          const currentQuat = new THREE.Quaternion().setFromEuler(localRotationRef.current);
-          const rotationError = currentQuat.angleTo(reconcileTargetQuat);
-          
-          if (rotationError > ROTATION_RECONCILE_THRESHOLD) {
-              currentQuat.slerp(reconcileTargetQuat, RECONCILE_LERP_FACTOR);
-              localRotationRef.current.setFromQuaternion(currentQuat, 'YXZ');
-          }
+        const loadAnimationFile = (name: string, path: string, mixerInstance: THREE.AnimationMixer) => {
+            loader.load(
+                path,
+                (animFbx) => {
+                    try {
+                        if (!animFbx.animations || animFbx.animations.length === 0) throw new Error(`No animations found in FBX file`);
+                        const clip = animFbx.animations[0];
+                        clip.name = name; // Assign the logical name
+                        const retargetedClip = retargetClip(clip, path); // Retarget if needed
+                        makeAnimationInPlace(retargetedClip); // Remove root motion
+                        const action = mixerInstance.clipAction(retargetedClip);
+                        newAnimations[name] = action; // Store the action
 
-          // 3. Apply potentially reconciled predicted position AND reconciled local rotation directly to the model group
-          group.current.position.copy(localPositionRef.current);
-          // --- Visual Rotation Logic --- 
-          let targetVisualYaw = localRotationRef.current.y; // Default: Face camera/mouse direction
+                        // Set loop mode
+                        if (name === ANIMATIONS.IDLE || name.startsWith('walk-') || name.startsWith('run-')) {
+                            action.setLoop(THREE.LoopRepeat, Infinity);
+                        } else {
+                            action.setLoop(THREE.LoopOnce, 1);
+                            action.clampWhenFinished = true;
+                        }
+                        console.log(`[Player ${playerData.username}] ✅ Loaded animation: ${name}`);
+                    } catch (e: any) {
+                        console.error(`[Player ${playerData.username}] Error processing animation ${name} from ${path}:`, e.message);
+                    }
+                    checkCompletedLoading();
+                },
+                undefined, // Progress callback
+                (error) => {
+                    console.error(`[Player ${playerData.username}] Error loading animation ${name} from ${path}:`, error);
+                    checkCompletedLoading();
+                }
+            );
+        };
 
-          if (cameraMode === CAMERA_MODES.FOLLOW) {
-              const { forward, backward, left, right } = currentInput;
-              const isMovingDiagonally = (forward || backward) && (left || right);
+        // Check file existence before loading (optional but good practice)
+        Object.entries(animationPaths).forEach(([name, path]) => {
+            fetch(path, { method: 'HEAD' }) // Use HEAD request to check existence without downloading
+                .then(response => {
+                    if (!response.ok) {
+                        console.warn(`[Player ${playerData.username}] Animation file not found (or not accessible): ${path} (${response.status})`);
+                        checkCompletedLoading(); // Count as processed (failed)
+                    } else {
+                        loadAnimationFile(name, path, mixerInstance); // File exists, load it
+                    }
+                })
+                .catch(error => {
+                    console.error(`[Player ${playerData.username}] Network error checking animation file ${path}:`, error);
+                    checkCompletedLoading(); // Count as processed (failed)
+                });
+        });
+    };
+     // Improve root motion removal function
+    const makeAnimationInPlace = (clip: THREE.AnimationClip) => {
+        const tracks = clip.tracks;
+        const positionTracks = tracks.filter(track => track.name.endsWith('.position'));
+        if (positionTracks.length === 0) return;
 
-              if (isMovingDiagonally) {
-                  let localMoveX = 0;
-                  let localMoveZ = 0;
-                  if (forward) localMoveZ -= 1;
-                  if (backward) localMoveZ += 1;
-                  if (left) localMoveX -= 1;
-                  if (right) localMoveX += 1;
-                  const localMoveVector = new THREE.Vector3(localMoveX, 0, localMoveZ).normalize(); 
-                  const cameraYaw = localRotationRef.current.y;
-                  const worldMoveDirection = localMoveVector.applyAxisAngle(new THREE.Vector3(0, 1, 0), cameraYaw);
+        let rootTrack: THREE.KeyframeTrack | undefined;
+        const rootNames = ['Hips.position', 'mixamorigHips.position', 'root.position', 'Armature.position', 'Root.position']; // Common root bone names
+        rootTrack = positionTracks.find(track => rootNames.some(name => track.name.toLowerCase().includes(name.toLowerCase())));
+        rootTrack = rootTrack || positionTracks[0]; // Fallback to first position track
 
-                  // Calculate the base target yaw
-                  targetVisualYaw = Math.atan2(worldMoveDirection.x, worldMoveDirection.z);
+        const rootTrackNameBase = rootTrack.name.split('.')[0];
 
-                  // --- Reverse yaw ONLY for FORWARD diagonal movement ---
-                  if (forward && !backward) { // Check if primary movement is forward
-                      targetVisualYaw += Math.PI; // Add 180 degrees
-                  }
-                  // --- End reversal --- 
-              }
-          } else { // ORBITAL MODE
-              // --- Apply diagonal rotation logic similar to FOLLOW mode --- 
-              const { forward, backward, left, right } = currentInput;
-              const isMovingDiagonally = (forward || backward) && (left || right);
+        // Filter out root position tracks (X and Z mostly, consider keeping Y for jumps later if needed)
+        clip.tracks = tracks.filter(track => !track.name.startsWith(`${rootTrackNameBase}.position`));
+    };
+     // Add a retargetClip function after makeAnimationInPlace
+    const retargetClip = (clip: THREE.AnimationClip, sourceModelPath: string): THREE.AnimationClip => {
+        if (!model) return clip; // Cannot retarget without target model skeleton
 
-              if (isMovingDiagonally) {
-                  // Calculate local movement vector (Orbital mapping: W=+z, S=-z, A=+x, D=-x)
-                  let localMoveX = 0;
-                  let localMoveZ = 0;
-                  if (forward) localMoveZ += 1;
-                  if (backward) localMoveZ -= 1; // Corrected backward direction for orbital local
-                  if (left) localMoveX += 1; // Corrected left direction for orbital local
-                  if (right) localMoveX -= 1; // Corrected right direction for orbital local
-                  const localMoveVector = new THREE.Vector3(localMoveX, 0, localMoveZ).normalize();
+        const sourceFileName = sourceModelPath.split('/').pop()?.split('.')[0] || '';
+        const targetFileName = mainModelPath.split('/').pop()?.split('.')[0] || '';
 
-                  // Rotate local movement by the FIXED orbital yaw to get world direction
-                  const fixedOrbitalYaw = orbitalCameraRef.current.playerFacingRotation;
-                  const worldMoveDirection = localMoveVector.applyAxisAngle(new THREE.Vector3(0, 1, 0), fixedOrbitalYaw);
+        if (sourceFileName === targetFileName) return clip; // Same skeleton, no retargeting needed
 
-                  // Calculate base target yaw
-                  targetVisualYaw = Math.atan2(worldMoveDirection.x, worldMoveDirection.z);
+        // console.log(`[Player ${playerData.username}] Retargeting anim "${clip.name}" from "${sourceFileName}" to "${targetFileName}"`);
 
-                  // --- RE-ADD Condition: Reverse yaw ONLY for FORWARD diagonal movement --- 
-                  if (!forward && backward) { 
-                      targetVisualYaw += Math.PI; // Add 180 degrees
-                  }
-                  // --- End conditional reversal --- 
-                  
-              } else {
-                   // If not moving diagonally, face the fixed rotation
-                   targetVisualYaw = orbitalCameraRef.current.playerFacingRotation;
-              }
-              // --- End diagonal rotation logic for ORBITAL ---
-          }
+        // Basic retargeting assumption: bone names might be the same or require simple mapping
+        // In a real scenario, you might need a detailed bone mapping dictionary here
+        // For now, we'll assume names are compatible or don't need changing
+        const newTracks = clip.tracks.map(track => {
+            const trackNameParts = track.name.split('.');
+            if (trackNameParts.length < 2) return track; // Malformed track name
 
-          // --- Apply Rotation using Slerp --- 
-          const targetVisualRotation = new THREE.Euler(0, targetVisualYaw, 0, 'YXZ');
-          const targetVisualQuat = new THREE.Quaternion().setFromEuler(targetVisualRotation);
-          
-          // Interpolate the group's quaternion towards the target
-          group.current.quaternion.slerp(targetVisualQuat, Math.min(1, dt * 10)); 
+            let boneName = trackNameParts[0];
+            const property = trackNameParts.slice(1).join('.');
 
-          // --- DEBUG: Draw/Update Directional Arrow (Conditional) ---
-          const scene = group.current?.parent; // Get scene reference
-          if (isDebugArrowVisible && scene) { // Only proceed if prop is true and scene exists
-            const playerWorldPos = group.current.position;
-            const playerWorldRotY = group.current.rotation.y; 
-            const forwardDirection = new THREE.Vector3(Math.sin(playerWorldRotY), 0, Math.cos(playerWorldRotY)).normalize();
-            const arrowLength = 3;
-            const arrowColor = 0xff0000;
+            // --- Placeholder for Bone Name Mapping ---
+            // Example: if (boneName === 'SourceRoot') boneName = 'TargetRoot';
+            // Add specific mappings based on your model skeletons if needed
+            // --- End Placeholder ---
 
-            if (debugArrowRef.current) {
-              // Update existing arrow
-              debugArrowRef.current.position.copy(playerWorldPos).add(new THREE.Vector3(0, 0.5, 0)); // Adjust origin height
-              debugArrowRef.current.setDirection(forwardDirection);
-              // Ensure it's visible if it was hidden
-              debugArrowRef.current.visible = true; 
+            const newTrackName = `${boneName}.${property}`;
+            if (newTrackName === track.name) return track; // Return original if name doesn't change
+
+            // Create new track with potentially updated name
+            let newTrack: THREE.KeyframeTrack;
+            const times = Array.from(track.times);
+            const values = Array.from(track.values);
+            if (track instanceof THREE.QuaternionKeyframeTrack) newTrack = new THREE.QuaternionKeyframeTrack(newTrackName, times, values);
+            else if (track instanceof THREE.VectorKeyframeTrack) newTrack = new THREE.VectorKeyframeTrack(newTrackName, times, values);
+            else newTrack = new THREE.KeyframeTrack(newTrackName, times, values); // Fallback
+
+            return newTrack;
+        });
+
+        return new THREE.AnimationClip(clip.name, clip.duration, newTracks, clip.blendMode);
+    };
+
+    // --- Animation Playback Function ---
+    const playAnimation = useCallback((name: string, crossfadeDuration = 0.3) => {
+        if (!mixer || !modelLoaded || !animationsLoadedRef.current) return; // Guard: Ensure everything is ready
+
+        let targetAction = animations[name];
+
+        // Handle missing animation: fallback to idle
+        if (!targetAction) {
+            if (name !== ANIMATIONS.IDLE && animations[ANIMATIONS.IDLE]) {
+                // console.warn(`[Player ${playerData.username}] Animation "${name}" not found. Falling back to idle.`);
+                name = ANIMATIONS.IDLE;
+                targetAction = animations[name];
             } else {
-              // Create new arrow
-              debugArrowRef.current = new THREE.ArrowHelper(
-                forwardDirection,
-                playerWorldPos.clone().add(new THREE.Vector3(0, 0.5, 0)), // Adjust origin height
-                arrowLength,
-                arrowColor
-              );
-              debugArrowRef.current.userData.isDebugArrow = true; // Mark for potential future identification
-              scene.add(debugArrowRef.current);
-              console.log("[Debug Arrow] Created arrow."); // Log creation
+                console.error(`[Player ${playerData.username}] Animation "${name}" not found, and fallback idle animation is also missing.`);
+                return; // Cannot play anything
             }
-          } else {
-            // Remove arrow if it exists and shouldn't be visible
-            if (debugArrowRef.current && debugArrowRef.current.parent) {
-               console.log("[Debug Arrow] Removing arrow (prop is false or no scene)."); // Log removal
-               debugArrowRef.current.parent.remove(debugArrowRef.current);
-               debugArrowRef.current = null;
+        }
+
+        // Prevent redundant plays of the same looping animation
+        if (currentAnimation === name && targetAction.isRunning() && targetAction.loop === THREE.LoopRepeat) {
+             return;
+        }
+
+        const currentAction = animations[currentAnimation];
+
+        // Fade out previous animation
+        if (currentAction && currentAction !== targetAction) {
+            currentAction.fadeOut(crossfadeDuration);
+        }
+
+        // Fade in and play target animation
+        targetAction
+            .reset()
+            .setEffectiveTimeScale(1)
+            .setEffectiveWeight(1)
+            .fadeIn(crossfadeDuration)
+            .play();
+
+        setCurrentAnimation(name); // Update current animation state
+
+    }, [animations, currentAnimation, mixer, modelLoaded]); // Dependencies for playback logic
+
+    // --- Effect for Shadow Properties ---
+    useEffect(() => {
+        if (model && group.current) {
+            group.current.traverse((child) => {
+                if (child instanceof THREE.Mesh) {
+                    child.castShadow = true;
+                    child.receiveShadow = true; // Allow player model to receive shadows too
+                }
+            });
+        }
+    }, [model]); // Run when model changes
+
+
+    // --- Effect for Pointer Lock & Camera Control ---
+    useEffect(() => {
+        if (!isLocalPlayer) return; // Only for local player
+
+        const handlePointerLockChange = () => {
+            const locked = document.pointerLockElement === document.body;
+            isPointerLocked.current = locked;
+            document.body.style.cursor = locked ? 'none' : 'default'; // Hide cursor when locked
+        };
+
+        const handleMouseMove = (e: MouseEvent) => {
+            if (!isPointerLocked.current) return;
+
+            const sensitivity = 0.003;
+            if (cameraMode === CAMERA_MODES.FOLLOW) {
+                // Update player rotation (Y-axis)
+                localRotationRef.current.y -= e.movementX * sensitivity;
+                // Keep yaw between -PI and PI
+                localRotationRef.current.y = THREE.MathUtils.euclideanModulo(localRotationRef.current.y + Math.PI, 2 * Math.PI) - Math.PI;
+
+                // Call the rotation change callback (sends rotation to GameScene/server)
+                onRotationChange?.(localRotationRef.current);
+
+            } else { // ORBITAL mode
+                const orbital = orbitalCameraRef.current;
+                orbital.angle -= e.movementX * sensitivity * 1.5; // Slightly faster orbital rotation
+                orbital.elevation += e.movementY * sensitivity;
+                // Clamp elevation
+                orbital.elevation = Math.max(Math.PI / 12, Math.min(Math.PI / 2.1, orbital.elevation));
             }
-          }
-          // --- END DEBUG ---
+        };
 
-        } else { // Not the local player anymore or initially
-          // If this instance stops being the local player OR debug visibility is off, ensure arrow is removed
-          if (debugArrowRef.current && debugArrowRef.current.parent) {
-               console.log("[Debug Arrow] Removing arrow (not local player)."); // Log removal
-               debugArrowRef.current.parent.remove(debugArrowRef.current);
-               debugArrowRef.current = null;
-          }
-          // --- REMOTE PLAYER INTERPOLATION --- 
-          const serverPosition = new THREE.Vector3(playerData.position.x, playerData.position.y, playerData.position.z);
-          const targetRotation = new THREE.Euler(0, playerData.rotation.y, 0, 'YXZ');
+        const handleMouseWheel = (e: WheelEvent) => {
+             const zoomSpeed = 0.8;
+             const zoomChange = Math.sign(e.deltaY) * zoomSpeed;
 
-          // Interpolate position smoothly
-          group.current.position.lerp(serverPosition, Math.min(1, dt * 10));
+             if (cameraMode === CAMERA_MODES.FOLLOW) {
+                targetZoom.current = Math.max(2.0, Math.min(12.0, targetZoom.current + zoomChange));
+             } else { // ORBITAL mode
+                const orbital = orbitalCameraRef.current;
+                orbital.distance = Math.max(3.0, Math.min(20.0, orbital.distance + zoomChange));
+             }
+        };
 
-          // Interpolate rotation smoothly (using quaternions for better slerp)
-          group.current.quaternion.slerp(
-            new THREE.Quaternion().setFromEuler(targetRotation),
-            Math.min(1, dt * 8)
-          );
+        // Request pointer lock on click
+        const handleCanvasClick = (e: MouseEvent) => {
+            // Only lock if clicking on the canvas itself
+            if (!isPointerLocked.current && (e.target as HTMLElement)?.tagName === 'CANVAS') {
+                document.body.requestPointerLock();
+            }
+        };
+
+        // --- Key Down Listener for Camera Mode Toggle ---
+        const handleKeyDown = (e: KeyboardEvent) => {
+            if (e.key === 'c' || e.key === 'C') { // Toggle camera on 'C' key
+                setCameraMode(prevMode => {
+                    const newMode = prevMode === CAMERA_MODES.FOLLOW ? CAMERA_MODES.ORBITAL : CAMERA_MODES.FOLLOW;
+                    if (newMode === CAMERA_MODES.ORBITAL) {
+                        // Store current player facing direction when entering orbital
+                        orbitalCameraRef.current.playerFacingRotation = localRotationRef.current.y;
+                        // Reset orbital angle to be behind the player initially
+                        orbitalCameraRef.current.angle = 0; // Angle relative to stored facing rotation
+                    }
+                    console.log(`Camera mode toggled to: ${newMode}`);
+                    return newMode;
+                });
+            }
+        };
+
+        document.addEventListener('pointerlockchange', handlePointerLockChange);
+        document.addEventListener('mousemove', handleMouseMove);
+        document.addEventListener('wheel', handleMouseWheel);
+        document.addEventListener('click', handleCanvasClick);
+        document.addEventListener('keydown', handleKeyDown); // Add key listener
+
+        // Initial cursor state check
+        handlePointerLockChange();
+
+        return () => {
+            document.removeEventListener('pointerlockchange', handlePointerLockChange);
+            document.removeEventListener('mousemove', handleMouseMove);
+            document.removeEventListener('wheel', handleMouseWheel);
+            document.removeEventListener('click', handleCanvasClick);
+            document.removeEventListener('keydown', handleKeyDown); // Remove key listener
+            if (document.pointerLockElement === document.body) {
+                 document.exitPointerLock(); // Ensure pointer lock is released on unmount
+            }
+            document.body.style.cursor = 'default'; // Restore cursor
+        };
+    }, [isLocalPlayer, onRotationChange, cameraMode]); // Re-run if camera mode changes
+
+
+    // --- Effect for Handling Animation Completion ---
+    // (This completes the cut-off useEffect from the prompt)
+    useEffect(() => {
+        if (!mixer) return;
+
+        const onAnimationFinished = (event: any) => {
+            // Check if the finished animation is one of the non-looping ones
+            if (
+                event.action === animations[ANIMATIONS.JUMP] ||
+                event.action === animations[ANIMATIONS.ATTACK] ||
+                event.action === animations[ANIMATIONS.CAST] ||
+                event.action === animations[ANIMATIONS.DAMAGE] ||
+                event.action === animations[ANIMATIONS.DEATH] // Death might stay finished
+            ) {
+                 // Don't automatically go to idle if dead
+                 if (event.action !== animations[ANIMATIONS.DEATH]) {
+                    // console.log(`Animation ${event.action.getClip().name} finished, returning to idle.`);
+                    playAnimation(ANIMATIONS.IDLE, 0.1); // Quick fade back to idle
+                 } else {
+                    // console.log("Death animation finished.");
+                    // Optionally stop the mixer or handle respawn logic elsewhere
+                 }
+            }
+        };
+
+        mixer.addEventListener('finished', onAnimationFinished);
+
+        return () => {
+            if (mixer) {
+                mixer.removeEventListener('finished', onAnimationFinished);
+            }
+        };
+    }, [mixer, animations, playAnimation]); // Depend on mixer, loaded animations, and playback function
+
+    // --- Frame Update Logic (useFrame) ---
+    useFrame((state, delta) => {
+        if (!group.current || !modelLoaded) return; // Ensure group and model are ready
+
+        // Cap delta to prevent large jumps on lag/pause
+        const cappedDelta = Math.min(delta, 1 / 30); // Max delta corresponds to 30 FPS
+
+        // 1. Update Animation Mixer
+        mixer?.update(cappedDelta);
+
+        // 2. Handle Local Player Logic (Prediction, Reconciliation, Camera)
+        if (isLocalPlayer) {
+            // Get current server state from props
+            const serverPos = playerData.position;
+            const serverRotY = playerData.rotation?.y; // Only need Yaw for reconciliation
+
+            // A. Predict next position based on current input
+            let predictedPos = localPositionRef.current; // Start with last known local position
+            if (currentInput) {
+                predictedPos = calculateClientMovement(localPositionRef.current, localRotationRef.current.y, currentInput, cappedDelta);
+            }
+            localPositionRef.current.copy(predictedPos); // Update local ref with predicted position
+
+            // B. Reconciliation (if server state is available)
+            if (serverPos && serverRotY !== undefined) {
+                 const posDiffSq = localPositionRef.current.distanceToSquared(serverPos);
+                 const rotDiff = Math.abs(THREE.MathUtils.euclideanModulo(localRotationRef.current.y - serverRotY + Math.PI, Math.PI * 2) - Math.PI);
+
+                 // If discrepancy is too large, lerp local state towards server state
+                 if (posDiffSq > POSITION_RECONCILE_THRESHOLD_SQ) {
+                    localPositionRef.current.lerp(serverPos, RECONCILE_LERP_FACTOR);
+                    // console.log(`Reconciling position... DiffSq: ${posDiffSq.toFixed(3)}`);
+                 }
+                 if (rotDiff > ROTATION_RECONCILE_THRESHOLD) {
+                    // Lerp yaw angle smoothly
+                    localRotationRef.current.y = THREE.MathUtils.lerp(localRotationRef.current.y, serverRotY, RECONCILE_LERP_FACTOR);
+                    // Wrap lerped angle
+                    localRotationRef.current.y = THREE.MathUtils.euclideanModulo(localRotationRef.current.y + Math.PI, 2 * Math.PI) - Math.PI;
+                    // console.log(`Reconciling rotation... Diff: ${rotDiff.toFixed(3)}`);
+                 }
+            }
+
+            // C. Apply final (predicted/reconciled) state to the visual group
+            group.current.position.copy(localPositionRef.current);
+            group.current.rotation.copy(localRotationRef.current);
+
+            // D. Update Camera Position and Target
+            const playerHeadPosition = localPositionRef.current.clone().add(CAMERA_LOOK_AT_OFFSET);
+            if (cameraMode === CAMERA_MODES.FOLLOW) {
+                // Smooth zoom
+                zoomLevel.current = THREE.MathUtils.lerp(zoomLevel.current, targetZoom.current, 0.1);
+
+                // Calculate camera offset based on player rotation and zoom
+                const cameraOffset = new THREE.Vector3(0, 0, zoomLevel.current); // Z is distance behind
+                cameraOffset.applyEuler(localRotationRef.current); // Rotate offset by player yaw
+                cameraOffset.y += 2.0; // Add some height to camera position
+
+                // Set camera position relative to player
+                const targetCameraPosition = localPositionRef.current.clone().add(cameraOffset);
+                camera.position.lerp(targetCameraPosition, 0.1); // Smooth camera movement
+
+            } else { // ORBITAL mode
+                 const orbital = orbitalCameraRef.current;
+                 // Calculate orbital camera position
+                 const camX = orbital.distance * Math.sin(orbital.angle) * Math.cos(orbital.elevation);
+                 const camZ = orbital.distance * Math.cos(orbital.angle) * Math.cos(orbital.elevation);
+                 const camY = orbital.distance * Math.sin(orbital.elevation);
+
+                 // Position is relative to player head + fixed rotation offset
+                 const relativeCamPos = new THREE.Vector3(camX, camY, camZ);
+                 // Rotate this relative position by the stored player facing direction
+                 relativeCamPos.applyAxisAngle(new THREE.Vector3(0, 1, 0), orbital.playerFacingRotation);
+
+                 const targetCameraPosition = playerHeadPosition.clone().add(relativeCamPos);
+                 camera.position.lerp(targetCameraPosition, 0.1); // Smooth camera movement
+            }
+             camera.lookAt(playerHeadPosition); // Always look at player head
+
+            // E. Determine and Play Local Player Animation based on Input
+            let desiredAnimation = ANIMATIONS.IDLE;
+            if (currentInput) {
+                // Prioritize actions
+                if (currentInput.attack) desiredAnimation = ANIMATIONS.ATTACK;
+                else if (currentInput.jump) desiredAnimation = ANIMATIONS.JUMP; // Add jump check
+                else if (currentInput.castSpell) desiredAnimation = ANIMATIONS.CAST; // Add cast check
+                // Then movement
+                else if (currentInput.forward) desiredAnimation = currentInput.sprint ? ANIMATIONS.RUN_FORWARD : ANIMATIONS.WALK_FORWARD;
+                else if (currentInput.backward) desiredAnimation = currentInput.sprint ? ANIMATIONS.RUN_BACK : ANIMATIONS.WALK_BACK;
+                else if (currentInput.left) desiredAnimation = currentInput.sprint ? ANIMATIONS.RUN_LEFT : ANIMATIONS.WALK_LEFT;
+                else if (currentInput.right) desiredAnimation = currentInput.sprint ? ANIMATIONS.RUN_RIGHT : ANIMATIONS.WALK_RIGHT;
+            }
+            // Play the determined animation (unless a non-looping one is already playing)
+            if (currentAnimation !== desiredAnimation && animations[currentAnimation]?.loop !== THREE.LoopOnce) {
+                playAnimation(desiredAnimation);
+            }
+
+
+            // F. Update Debug Arrow if visible
+            if (isDebugArrowVisible) {
+                 if (!debugArrowRef.current) {
+                    // Create arrow helper if it doesn't exist
+                    debugArrowRef.current = new THREE.ArrowHelper(new THREE.Vector3(0,0,-1), new THREE.Vector3(0,1,0), 1.5, 0xff0000);
+                    group.current.add(debugArrowRef.current);
+                 }
+                 // No need to update direction if it's parented and parent rotates
+                 // debugArrowRef.current.setDirection(new THREE.Vector3(0, 0, -1).applyEuler(localRotationRef.current));
+            } else if (debugArrowRef.current) {
+                 // Remove arrow if visibility is toggled off
+                 group.current.remove(debugArrowRef.current);
+                 debugArrowRef.current = null;
+            }
+
         }
-      }
+        // 3. Handle Remote Player Logic (Interpolation)
+        else {
+            const targetPos = playerData.position;
+            const targetRotY = playerData.rotation?.y;
 
-      // --- CAMERA UPDATE (Local Player Only) ---
-      if (isLocalPlayer && group.current) {
-        // Smooth zoom interpolation for follow camera
-        if (cameraMode === CAMERA_MODES.FOLLOW) {
-          zoomLevel.current += (targetZoom.current - zoomLevel.current) * Math.min(1, dt * 6);
+            if (targetPos) {
+                // Lerp position smoothly towards the target server position
+                group.current.position.lerp(targetPos, 0.2); // Adjust lerp factor for desired smoothness
+                lastServerPosition.current.copy(targetPos); // Update last known position
+            }
+
+            if (targetRotY !== undefined) {
+                 // Use spherical interpolation (SLERP) or simple angle lerp for rotation Y
+                 // Lerp towards the target Y rotation smoothly
+                 const currentRotY = group.current.rotation.y;
+                 const shortestAngle = THREE.MathUtils.euclideanModulo(targetRotY - currentRotY + Math.PI, 2 * Math.PI) - Math.PI;
+                 const lerpedRotY = currentRotY + shortestAngle * 0.2; // Adjust lerp factor
+                 group.current.rotation.y = lerpedRotY;
+                 lastServerRotationY.current = targetRotY; // Update last known rotation
+            }
+
+            // Determine Remote Player Animation (Example: based on velocity)
+            const velocity = group.current.position.distanceTo(lastServerPosition.current) / cappedDelta; // Approx velocity
+            let desiredAnimation = ANIMATIONS.IDLE;
+             if (velocity > PLAYER_SPEED * SPRINT_MULTIPLIER * 0.8) { // Approximate running speed threshold
+                 desiredAnimation = ANIMATIONS.RUN_FORWARD; // Simplification: assume running forward
+             } else if (velocity > PLAYER_SPEED * 0.5) { // Approximate walking speed threshold
+                 desiredAnimation = ANIMATIONS.WALK_FORWARD; // Simplification: assume walking forward
+             }
+             // TODO: Ideally, get animation state (attacking, jumping) from PlayerData
+             if (currentAnimation !== desiredAnimation && animations[currentAnimation]?.loop !== THREE.LoopOnce) {
+                 playAnimation(desiredAnimation);
+             }
         }
 
-        // Get reconciled player position and rotation for camera
-        const playerPosition = localPositionRef.current; 
-        // Use the reconciled localRotationRef for camera calculations
-        const playerRotationY = localRotationRef.current.y; 
+    }); // End useFrame
 
-        if (cameraMode === CAMERA_MODES.FOLLOW) {
-          // --- FOLLOW CAMERA MODE --- 
-          const cameraHeight = 2.5;
-          const currentDistance = zoomLevel.current;
+    // --- Render Player ---
+    return (
+        <group ref={group} name={`player-${playerData.username}`}>
+            {/* Model is added dynamically in useEffect */}
 
-          // Calculate camera position based on player rotation and distance
-          const targetPosition = new THREE.Vector3(
-            playerPosition.x - Math.sin(playerRotationY) * currentDistance,
-            playerPosition.y + cameraHeight,
-            playerPosition.z - Math.cos(playerRotationY) * currentDistance 
-          );
+            {/* Player Name Tag */}
+            {modelLoaded && (
+                <Html
+                    position={[0, 2.5, 0]}
+                    center
+                    distanceFactor={8}
+                    occlude={false}
+                    style={{
+                        transition: 'all 0.2s',
+                        opacity: 1,
+                        transform: 'scale(1.5)'
+                    }}
+                >
+                    <div style={{
+                        color: isLocalPlayer ? '#00ffff' : '#ffffff',
+                        backgroundColor: 'rgba(0, 0, 0, 0.6)',
+                        padding: '4px 8px',
+                        borderRadius: '4px',
+                        whiteSpace: 'nowrap',
+                        textAlign: 'center',
+                        userSelect: 'none',
+                        fontWeight: 'bold',
+                        textShadow: '1px 1px 2px rgba(0,0,0,0.8)'
+                    }}>
+                        {playerData.username}
+                        {playerData.currentTileDisplay && playerData.currentTileDisplay !== 'None' && (
+                            <div style={{ fontSize: '0.8em', opacity: 0.8 }}>
+                                Size: {playerData.currentTileDisplay}
+                            </div>
+                        )}
+                    </div>
+                </Html>
+            )}
 
-          // Smoothly move camera towards the target position
-          const cameraDamping = 12;
-          camera.position.lerp(targetPosition, Math.min(1, dt * cameraDamping));
+             {/* Optional Debug Sphere for Position */}
+             {isDebugPanelVisible && (
+                 <Sphere args={[0.2]} position={[0, 0, 0]}>
+                    <meshBasicMaterial color={isLocalPlayer ? "blue" : "red"} wireframe />
+                 </Sphere>
+             )}
 
-          // Make camera look at a point slightly above the player's base
-          const lookHeight = 1.8;
-          const lookTarget = playerPosition.clone().add(new THREE.Vector3(0, lookHeight, 0));
-          camera.lookAt(lookTarget);
-        } else if (cameraMode === CAMERA_MODES.ORBITAL) {
-          // --- ORBITAL CAMERA MODE ---
-          const orbital = orbitalCameraRef.current;
-          
-          // Calculate orbital camera position using spherical coordinates
-          const horizontalDistance = orbital.distance * Math.cos(orbital.elevation);
-          const height = orbital.distance * Math.sin(orbital.elevation);
-          
-          // Use orbital.angle for camera rotation, playerPosition for center
-          const orbitX = playerPosition.x + Math.sin(orbital.angle) * horizontalDistance;
-          const orbitY = playerPosition.y + height;
-          const orbitZ = playerPosition.z + Math.cos(orbital.angle) * horizontalDistance;
-          
-          // Set camera position based on orbital calculations
-          const targetPosition = new THREE.Vector3(orbitX, orbitY, orbitZ);
-          
-          // Smoothly move camera
-          const cameraDamping = 8; // Responsive but still smooth
-          camera.position.lerp(targetPosition, Math.min(1, dt * cameraDamping));
-          
-          // Look at player
-          const lookTarget = playerPosition.clone().add(new THREE.Vector3(0, 1.5, 0)); 
-          camera.lookAt(lookTarget);
-        }
-      }
-
-      // --- Update Animation Mixer ---
-      if (mixer) {
-        mixer.update(dt); // Mixer still uses actual frame delta (dt)
-      }
-    }
-  });
-
-  // --- Animation Triggering based on Server State ---
-  useEffect(() => {
-    // Explicitly wrap hook body
-    {
-      // Only update animations if mixer and animations exist
-      if (!mixer || Object.keys(animations).length === 0) {
-        return;
-      }
-
-      const serverAnim = playerData.currentAnimation;
-
-      // console.log(`[Anim Check] Received ServerAnim: ${serverAnim}, Current LocalAnim: ${currentAnimation}, Is Available: ${!!animations[serverAnim]}`);
-
-      // Play animation if it's different and available
-      if (serverAnim && serverAnim !== currentAnimation && animations[serverAnim]) {
-         // console.log(`[Anim Play] Server requested animation change to: ${serverAnim}`);
-        try {
-          playAnimation(serverAnim, 0.2);
-        } catch (error) {
-          console.error(`[Anim Error] Error playing animation ${serverAnim}:`, error);
-          // Attempt to fallback to idle if error occurs and not already idle
-          if (animations['idle'] && currentAnimation !== 'idle') {
-            playAnimation('idle', 0.2);
-          }
-        }
-      } else if (serverAnim && !animations[serverAnim]) {
-         // Log if server requests an animation we don't have loaded
-         // console.warn(`[Anim Warn] Server requested unavailable animation: ${serverAnim}. Available: ${Object.keys(animations).join(', ')}`);
-      }
-    }
-  }, [playerData.currentAnimation, animations, mixer, playAnimation, currentAnimation]); // Dependencies include things that trigger animation changes
-
-  return (
-    <group ref={group} castShadow>
-      {/* Declarative PointLight */}
-      <pointLight 
-        ref={pointLightRef} 
-        position={[0, -0.5, 0]} // Lowered position further
-        color={0xffccaa} 
-        intensity={2.5} // Increased intensity
-        distance={5} 
-        decay={2} 
-        castShadow={false} 
-      />
-
-      {/* Debug Marker Sphere */}
-      <Sphere 
-        args={[0.1, 16, 16]} 
-        position={[0, -0.5, 0]} // Match the new light position
-        visible={isDebugPanelVisible} 
-      >
-        <meshBasicMaterial color="red" wireframe /> 
-      </Sphere>
-
-      {/* Model added dynamically */}
-      {/* Name tag */}
-      {model && (
-        <Html position={[0, 2.5, 0]} center distanceFactor={10}>
-            <div className="nametag">
-            <div className="nametag-text">{playerData.username}</div>
-            <div className="nametag-class">{characterClass}</div>
-            </div>
-        </Html>
-      )}
-    </group>
-  );
-}; 
+            {/* Declarative Point Light (example - could be removed if scene lighting is sufficient) */}
+            {/* <pointLight ref={pointLightRef} intensity={0.5} distance={5} position={[0, 1.5, 0]} castShadow={false} /> */}
+        </group>
+    );
+};

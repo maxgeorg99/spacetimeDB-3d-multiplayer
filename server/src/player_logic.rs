@@ -45,17 +45,15 @@ pub fn calculate_new_position(position: &Vector3, rotation: &Vector3, input: &In
     if has_movement_input {
         let speed = if input.sprint { PLAYER_SPEED * SPRINT_MULTIPLIER } else { PLAYER_SPEED };
 
-        // This approach more directly matches the new client implementation
         // Create basis vectors for movement (forward/right vectors from camera)
         // -Z is forward in Three.js coordinates 
         let yaw = rotation.y;
         
         // Forward and right unit vectors (initially along axes)
-        let forward = Vector3 { x: 0.0, y: 0.0, z: -1.0 };
-        let right = Vector3 { x: 1.0, y: 0.0, z: 0.0 };
+        let forward = Vector3 { x: 0.0, y: 0.0, z: -1.0 }; // -Z is forward
+        let right = Vector3 { x: 1.0, y: 0.0, z: 0.0 };   // +X is right
         
         // Rotate these vectors based on player rotation (around Y-axis)
-        // These are the rotation formulas for vectors around Y axis
         let cos_yaw = yaw.cos();
         let sin_yaw = yaw.sin();
         
@@ -76,21 +74,22 @@ pub fn calculate_new_position(position: &Vector3, rotation: &Vector3, input: &In
         // Accumulate movement along these basis vectors
         let mut direction = Vector3 { x: 0.0, y: 0.0, z: 0.0 };
         
+        // Now correctly apply input to match Three.js coordinate system
         if input.forward {
-            direction.x -= rotated_forward.x;
-            direction.z -= rotated_forward.z;
-        }
-        if input.backward {
-            direction.x += rotated_forward.x;
+            direction.x += rotated_forward.x;  // Add forward direction
             direction.z += rotated_forward.z;
         }
+        if input.backward {
+            direction.x -= rotated_forward.x;  // Subtract forward direction
+            direction.z -= rotated_forward.z;
+        }
         if input.right {
-            direction.x -= rotated_right.x;
-            direction.z -= rotated_right.z;
+            direction.x += rotated_right.x;    // Add right direction
+            direction.z += rotated_right.z;
         }
         if input.left {
-            direction.x += rotated_right.x;
-            direction.z += rotated_right.z;
+            direction.x -= rotated_right.x;    // Subtract right direction
+            direction.z -= rotated_right.z;
         }
         
         // Normalize for consistent speed in all directions

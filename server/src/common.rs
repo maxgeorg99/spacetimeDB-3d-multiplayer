@@ -47,5 +47,5 @@ pub struct InputState {
 
 // --- Game Constants ---
 
-pub const PLAYER_SPEED: f32 = 7.5;
-pub const SPRINT_MULTIPLIER: f32 = 1.8;
+pub const PLAYER_SPEED: f32 = 7.0;
+pub const SPRINT_MULTIPLIER: f32 = 1.5;

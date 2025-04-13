@@ -49,6 +49,7 @@ import { GameScene } from './components/GameScene';
 import { JoinGameDialog } from './components/JoinGameDialog';
 import * as THREE from 'three';
 import { PlayerUI } from './components/PlayerUI';
+import { VotingPanel } from './components/VotingPanel';
 
 // Type Aliases
 type DbConnection = moduleBindings.DbConnection;
@@ -56,6 +57,7 @@ type EventContext = moduleBindings.EventContext;
 type ErrorContext = moduleBindings.ErrorContext;
 type PlayerData = moduleBindings.PlayerData;
 type InputState = moduleBindings.InputState;
+type GameTile = moduleBindings.GameTile;
 // ... other types ...
 
 let conn: DbConnection | null = null;
@@ -65,6 +67,7 @@ function App() {
   const [identity, setIdentity] = useState<Identity | null>(null);
   const [statusMessage, setStatusMessage] = useState("Connecting...");
   const [players, setPlayers] = useState<ReadonlyMap<string, PlayerData>>(new Map());
+  const [tiles, setTiles] = useState<ReadonlyMap<string, GameTile>>(new Map());
   const [localPlayer, setLocalPlayer] = useState<PlayerData | null>(null);
   const [showJoinDialog, setShowJoinDialog] = useState(false);
   const [isDebugPanelExpanded, setIsDebugPanelExpanded] = useState(false);
@@ -86,6 +89,11 @@ function App() {
   const registerTableCallbacks = useCallback(() => {
     if (!conn) return;
     console.log("Registering table callbacks...");
+    
+    conn.db.gameTile.onInsert((_ctx: EventContext, tile: GameTile) => {
+        console.log("Tile inserted (callback):", tile.tileId);
+        setTiles((prev: ReadonlyMap<string, GameTile>) => new Map(prev).set(tile.tileId.toString(), tile));
+    });
 
     conn.db.player.onInsert((_ctx: EventContext, player: PlayerData) => {
         console.log("Player inserted (callback):", player.identity.toHexString());
@@ -453,6 +461,7 @@ function App() {
         <>
           <GameScene 
             players={players} 
+            tiles={tiles}
             localPlayerIdentity={identity} 
             onPlayerRotation={handlePlayerRotation}
             currentInputRef={currentInputRef}
@@ -460,6 +469,11 @@ function App() {
           />
           {/* Render PlayerUI only if localPlayer exists */} 
           {localPlayer && <PlayerUI playerData={localPlayer} />} 
+          <VotingPanel 
+            localPlayer={localPlayer} 
+            players={new Map(players)}
+            conn={conn}
+          />
         </>
       )}
 
