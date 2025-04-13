@@ -77,7 +77,8 @@ export const VotingPanel: React.FC<VotingPanelProps> = ({ localPlayer, players, 
       padding: '20px',
       borderRadius: '8px',
       color: 'white',
-      minWidth: '200px'
+      minWidth: '200px',
+      zIndex: 10
     }}>
       <h3>Scrum Poker</h3>
       
