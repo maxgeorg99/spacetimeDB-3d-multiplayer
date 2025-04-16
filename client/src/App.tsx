@@ -467,13 +467,17 @@ function App() {
             currentInputRef={currentInputRef}
             isDebugPanelVisible={isDebugPanelExpanded}
           />
-          {/* Render PlayerUI only if localPlayer exists */} 
-          {localPlayer && <PlayerUI playerData={localPlayer} />} 
-          <VotingPanel 
-            localPlayer={localPlayer} 
-            players={new Map(players)}
-            conn={conn}
-          />
+          {/* Render PlayerUI & Voting Panel only if localPlayer exists */} 
+          {localPlayer && (
+            <>
+              <PlayerUI playerData={localPlayer} />
+              <VotingPanel
+                localPlayer={localPlayer}
+                players={new Map(players)}
+                conn={conn}
+              />
+            </>
+          )}
         </>
       )}
 
