@@ -174,18 +174,26 @@ export const GameScene: React.FC<GameSceneProps> = ({
 }) => {
     const directionalLightRef = useRef<THREE.DirectionalLight>(null!);
 
+    // Check if local player exists in the cache
+    const localPlayerInCache = useMemo(() => {
+        if (!localPlayerIdentity) return false;
+        const playerIdString = localPlayerIdentity.toHexString();
+        return players.has(playerIdString);
+    }, [localPlayerIdentity, players]);
+
     // Process players to include T-shirt size zone information
     const playersWithTileInfo = useMemo(() => {
         return Array.from(players.values()).map(player => {
             const tileInfo = player.position ? getTileInfo(player.position) : null;
             const currentTileString = tileInfo ? `${tileInfo.size}` : 'None';
+
             // Return the original player object spread, plus the new display string
             return {
-                ...player, // Spread all fields from PlayerData
+                ...player,
                 currentTileDisplay: currentTileString,
             };
-        })
-    }, [players]); // Recalculate only when players map changes
+        });
+    }, [players]);
 
     // Convert local Identity to string for comparison safely
     const localPlayerIdString = useMemo(() => localPlayerIdentity?.toHexString(), [localPlayerIdentity]);
@@ -310,10 +318,10 @@ export const GameScene: React.FC<GameSceneProps> = ({
                     return (
                         <Player
                             key={playerIdString}
-                            playerData={playerDataForComponent}
+                            playerData={player}
                             isLocalPlayer={isLocal}
                             onRotationChange={isLocal ? onPlayerRotation : undefined}
-                            currentInput={isLocal ? currentInputRef?.current : undefined}
+                            currentInput={isLocal && localPlayerInCache? currentInputRef?.current : undefined}
                             isDebugArrowVisible={isLocal ? isDebugPanelVisible : false}
                             isDebugPanelVisible={isDebugPanelVisible}
                         />

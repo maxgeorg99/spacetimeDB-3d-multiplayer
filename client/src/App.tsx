@@ -48,8 +48,10 @@ import { DebugPanel } from './components/DebugPanel';
 import { GameScene } from './components/GameScene';
 import { JoinGameDialog } from './components/JoinGameDialog';
 import * as THREE from 'three';
-import { PlayerUI } from './components/PlayerUI';
+// Remove unused import
+// import { PlayerUI } from './components/PlayerUI';
 import { VotingPanel } from './components/VotingPanel';
+import { MainMenu } from './components/MainMenu';
 
 // Type Aliases
 type DbConnection = moduleBindings.DbConnection;
@@ -58,6 +60,7 @@ type ErrorContext = moduleBindings.ErrorContext;
 type PlayerData = moduleBindings.PlayerData;
 type InputState = moduleBindings.InputState;
 type GameTile = moduleBindings.GameTile;
+type Room = moduleBindings.Room;
 // ... other types ...
 
 let conn: DbConnection | null = null;
@@ -72,6 +75,9 @@ function App() {
   const [showJoinDialog, setShowJoinDialog] = useState(false);
   const [isDebugPanelExpanded, setIsDebugPanelExpanded] = useState(false);
   const [isPointerLocked, setIsPointerLocked] = useState(false); // State for pointer lock status
+  const [showMainMenu, setShowMainMenu] = useState(true);
+  const [rooms, setRooms] = useState<ReadonlyMap<string, Room>>(new Map());
+  const [selectedRoomName, setSelectedRoomName] = useState<string>("");
 
   // --- Ref for current input state ---
   const currentInputRef = useRef<InputState>({
@@ -127,6 +133,25 @@ function App() {
             setStatusMessage("Local player deleted!");
         }
     });
+
+    // Add room table callbacks
+    conn.db.room.onInsert((_ctx: EventContext, room: Room) => {
+      console.log("Room inserted:", room.name);
+      setRooms((prev: ReadonlyMap<string, Room>) => new Map(prev).set(room.name, room));
+    });
+
+    conn.db.room.onUpdate((_ctx: EventContext, _oldRoom: Room, newRoom: Room) => {
+      setRooms((prev: ReadonlyMap<string, Room>) => new Map(prev).set(newRoom.name, newRoom));
+    });
+
+    conn.db.room.onDelete((_ctx: EventContext, room: Room) => {
+      setRooms((prev: ReadonlyMap<string, Room>) => {
+        const newMap = new Map(prev);
+        newMap.delete(room.name);
+        return newMap;
+      });
+    });
+
     console.log("Table callbacks registered.");
   }, [identity]); // Keep identity dependency
 
@@ -157,6 +182,7 @@ function App() {
     console.log("Subscribing to tables...");
     const subscription = conn.subscriptionBuilder();
     subscription.subscribe("SELECT * FROM player");
+    subscription.subscribe("SELECT * FROM room");
     subscription.onApplied(onSubscriptionApplied);
     subscription.onError(onSubscriptionError);
   }, [identity, onSubscriptionApplied, onSubscriptionError]); // Add dependencies
@@ -398,7 +424,7 @@ function App() {
       registerTableCallbacks();
       setupInputListeners();
       setupDelegatedListeners();
-      setShowJoinDialog(true);
+      setShowMainMenu(true); // Show main menu on connect
     };
 
     const onDisconnect = (_ctx: ErrorContext, reason?: Error | null) => {
@@ -412,9 +438,11 @@ function App() {
       setLocalPlayer(null);
     };
 
+    // Build connection with WebSocket compression disabled
     moduleBindings.DbConnection.builder()
       .withUri(`ws://${dbHost}`)
       .withModuleName(dbName)
+      .withCompression('none') // Disable WebSocket compression
       .onConnect(onConnect)
       .onDisconnect(onDisconnect)
       .build();
@@ -432,18 +460,65 @@ function App() {
         console.error("Cannot join game, not connected.");
         return;
     }
-    console.log(`Registering as ${username} (${characterClass})...`);
-    conn.reducers.registerPlayer(username, characterClass);
+    if (!selectedRoomName) {
+        console.error("No room selected.");
+        return;
+    }
+    console.log(`Registering as ${username} (${characterClass}) in room ${selectedRoomName}...`);
+    conn.reducers.registerPlayer(username, characterClass, selectedRoomName);
     setShowJoinDialog(false);
   };
+
+  // Room management handlers
+  const handleCreateRoom = useCallback((roomName: string, password?: string) => {
+    if (!conn) return;
+    try {
+      conn.reducers.createRoom(roomName);
+      setSelectedRoomName(roomName); // Store the room name when creating
+      setShowMainMenu(false);
+      setShowJoinDialog(true); // Show join dialog after creating room
+    } catch (error) {
+      console.error("Failed to create room:", error);
+      setStatusMessage(`Failed to create room: ${error}`);
+    }
+  }, [conn]);
+
+  const handleJoinRoom = useCallback((roomName: string, password?: string) => {
+    if (!conn) return;
+    try {
+      conn.reducers.joinRoom(roomName, password || "");
+      setSelectedRoomName(roomName);
+      setShowMainMenu(false);
+      setShowJoinDialog(true); // Show join dialog after joining a room
+    } catch (error) {
+      console.error("Failed to join room:", error);
+      setStatusMessage(`Failed to join room: ${error}`);
+    }
+  }, [conn]);
 
   // --- Render Logic ---
   return (
     <div className="App" style={{ width: '100vw', height: '100vh', position: 'relative' }}>
-      {showJoinDialog && <JoinGameDialog onJoin={handleJoinGame} />}
+      {connected && showMainMenu && (
+        <MainMenu 
+          onCreateRoom={handleCreateRoom}
+          onJoinRoom={handleJoinRoom}
+          availableRooms={Array.from(rooms.values()).map(room => ({
+            id: room.name,
+            name: room.name,
+            playerCount: room.currentPlayerCount,
+            maxPlayers: room.maxPlayers,
+            hasPassword: !!room.password
+          }))}
+          isConnected={connected}
+        />
+      )}
+      
+      {showJoinDialog && !showMainMenu && <JoinGameDialog onJoin={handleJoinGame} />}
       
       {/* Conditionally render DebugPanel based on connection status */} 
       {/* Visibility controlled internally, expansion controlled by state */}
+      {/*
       {connected && (
           <DebugPanel 
             statusMessage={statusMessage}
@@ -452,11 +527,14 @@ function App() {
             playerMap={players}
             expanded={isDebugPanelExpanded}
             onToggleExpanded={() => setIsDebugPanelExpanded((prev: boolean) => !prev)}
-            isPointerLocked={isPointerLocked} // Pass pointer lock state down
+            isPointerLocked={isPointerLocked}
           />
       )}
+      */}
 
-      {/* Always render GameScene and PlayerUI when connected */} 
+      {/* Render GameScene and PlayerUI only when connected */}
+
+      {/* Always render GameScene when connected */} 
       {connected && (
         <>
           <GameScene 
@@ -470,7 +548,6 @@ function App() {
           {/* Render PlayerUI & Voting Panel only if localPlayer exists */} 
           {localPlayer && (
             <>
-              <PlayerUI playerData={localPlayer} />
               <VotingPanel
                 localPlayer={localPlayer}
                 players={new Map(players)}

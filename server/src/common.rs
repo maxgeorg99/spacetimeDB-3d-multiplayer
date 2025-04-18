@@ -49,3 +49,4 @@ pub struct InputState {
 
 pub const PLAYER_SPEED: f32 = 7.0;
 pub const SPRINT_MULTIPLIER: f32 = 1.5;
+pub const MAX_PLAYERS_PER_ROOM: u32 = 10;
