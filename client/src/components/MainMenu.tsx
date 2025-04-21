@@ -1,4 +1,5 @@
 import { useState } from 'react';
+import { JoinRoomDialog } from './JoinRoomDialog';
 
 interface Room {
   id: string;
@@ -25,14 +26,21 @@ export function MainMenu({
   const [roomPassword, setRoomPassword] = useState('');
   const [showCreateForm, setShowCreateForm] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [selectedRoom, setSelectedRoom] = useState<Room | null>(null);
+  // Keep track of room passwords
+  const [roomPasswords] = useState<Map<string, string>>(new Map());
   
   // Handle room creation
   const handleCreateRoom = async (e: React.FormEvent) => {
     e.preventDefault();
     setError(null);
+
     if (newRoomName.trim()) {
       try {
-        await onCreateRoom(newRoomName, roomPassword);
+        await onCreateRoom(newRoomName, roomPassword || undefined);
+        if (roomPassword) {
+          roomPasswords.set(newRoomName, roomPassword);
+        }
         setNewRoomName('');
         setRoomPassword('');
         setShowCreateForm(false);
@@ -43,24 +51,32 @@ export function MainMenu({
   };
 
   // Handle room selection
-  const handleRoomSelect = async (roomId: string) => {
-    const room = availableRooms.find(r => r.id === roomId);
-    if (!room) {
-      setError('Room not found');
-      return;
-    }
-    
+  const handleRoomSelect = async (room: Room) => {
     if (room.playerCount >= room.maxPlayers) {
       setError(`Room "${room.name}" is full (${room.playerCount}/${room.maxPlayers} players)`);
       return;
     }
 
     setError(null);
-    try {
-      await onJoinRoom(roomId);
-    } catch (err) {
-      setError(err instanceof Error ? err.message : String(err));
+    
+    if (room.hasPassword) {
+      // Show password dialog first
+      setSelectedRoom(room);
+    } else {
+      // Join directly if no password is required
+      try {
+        await onJoinRoom(room.id);
+      } catch (err) {
+        setError(err instanceof Error ? err.message : String(err));
+      }
     }
+  };
+
+  // Handle join with password
+  const handleJoinWithPassword = async (password: string) => {
+    if (!selectedRoom) return;
+    await onJoinRoom(selectedRoom.id, password);
+    setSelectedRoom(null);
   };
 
   return (
@@ -126,7 +142,11 @@ export function MainMenu({
                     <button 
                       type="button" 
                       className="menu-button secondary-button"
-                      onClick={() => setShowCreateForm(false)}
+                      onClick={() => {
+                        setShowCreateForm(false);
+                        setError(null);
+                        setRoomPassword('');
+                      }}
                     >
                       Cancel
                     </button>
@@ -145,7 +165,7 @@ export function MainMenu({
                     <li 
                       key={room.id} 
                       className={`room-item ${room.playerCount >= room.maxPlayers ? 'room-full' : ''}`}
-                      onClick={() => handleRoomSelect(room.id)}
+                      onClick={() => handleRoomSelect(room)}
                     >
                       <div className="room-info">
                         <span className="room-name">{room.name}</span>
@@ -156,7 +176,7 @@ export function MainMenu({
                         </span>
                       </div>
                       {room.hasPassword && (
-                        <span className="room-password-indicator">🔒</span>
+                        <span className="room-password-indicator" role="img" aria-label="Password protected">🔒</span>
                       )}
                     </li>
                   ))}
@@ -166,6 +186,18 @@ export function MainMenu({
           </>
         )}
       </div>
+
+      {selectedRoom && (
+        <JoinRoomDialog
+          roomName={selectedRoom.name}
+          roomPassword={roomPasswords.get(selectedRoom.id) || ''}
+          onJoin={handleJoinWithPassword}
+          onCancel={() => {
+            setSelectedRoom(null);
+            setError(null);
+          }}
+        />
+      )}
     </div>
   );
 }

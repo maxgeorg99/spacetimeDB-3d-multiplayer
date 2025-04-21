@@ -471,6 +471,8 @@ function App() {
     } catch (error) {
       console.error("Failed to register player:", error);
       setStatusMessage(`Failed to register: ${error}`);
+      setShowMainMenu(true);
+      setShowJoinDialog(false);
     }
   };
 
@@ -478,7 +480,7 @@ function App() {
   const handleCreateRoom = useCallback((roomName: string, password?: string) => {
     if (!conn) return;
     try {
-      conn.reducers.createRoom(roomName);
+      conn.reducers.createRoom(roomName, password);
       setSelectedRoomName(roomName); // Store the room name when creating
       setShowMainMenu(false);
       setShowJoinDialog(true); // Show join dialog after creating room
@@ -491,15 +493,18 @@ function App() {
   const handleJoinRoom = useCallback(async (roomName: string, password?: string) => {
     if (!conn) return;
     try {
+      // First try to join the room
       await conn.reducers.joinRoom(roomName, password || "");
+      
+      // If join successful, store room name and show registration dialog
       setSelectedRoomName(roomName);
       setShowMainMenu(false);
-      setShowJoinDialog(true); // Show join dialog after joining a room
+      setShowJoinDialog(true);
     } catch (error) {
       console.error("Failed to join room:", error);
+      // Don't hide the main menu on error, let it show the error in the password dialog
       setStatusMessage(`Failed to join room: ${error}`);
-      // Don't proceed to join dialog if join failed
-      return;
+      throw error; // Propagate error to MainMenu component
     }
   }, [conn]);
 

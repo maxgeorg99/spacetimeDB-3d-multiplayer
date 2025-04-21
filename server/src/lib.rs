@@ -231,7 +231,7 @@ fn initialize_player(
     let player_count = ctx.db.player().iter().count();
     let colors = ["cyan", "magenta", "yellow", "lightgreen", "white", "orange"];
     let assigned_color = colors[player_count % colors.len()].to_string();
-    let spawn_position = Vector3 { x: (player_count as f32 * 5.0) - 2.5, y: 1.0, z: 0.0 };
+    let spawn_position = Vector3 { x: 2.5, y: 1.0, z: 0.0 };
 
     let default_input = InputState {
         forward: false, backward: false, left: false, right: false,
@@ -260,7 +260,7 @@ fn initialize_player(
 }
 
 #[spacetimedb::reducer]
-pub fn create_room(ctx: &ReducerContext, room_name: String) -> Result<(), String> {
+pub fn create_room(ctx: &ReducerContext, room_name: String, password: Option<String>) -> Result<(), String> {
     // Check if room already exists
     if ctx.db.room().name().find(&room_name).is_some() {
         return Err(format!("Room '{}' already exists", room_name));
@@ -269,7 +269,7 @@ pub fn create_room(ctx: &ReducerContext, room_name: String) -> Result<(), String
     // Create the new room
     let new_room = Room {
         name: room_name,
-        password: None,
+        password,
         max_players: MAX_PLAYERS_PER_ROOM,
         current_player_count: 0,
         created_at: ctx.timestamp,
@@ -283,23 +283,14 @@ pub fn create_room(ctx: &ReducerContext, room_name: String) -> Result<(), String
 #[spacetimedb::reducer]
 pub fn join_room(ctx: &ReducerContext, room_name: String, password: String) -> Result<(), String> {
     let identity = ctx.sender;
-    
-    // First check if player exists
-    let player = ctx.db.player().identity().find(identity)
-        .ok_or_else(|| "Please register before joining a room".to_string())?;
 
-    // Then check if player is already in this room
-    if player.room_name == room_name {
-        return Err("Already in this room".to_string());
-    }
-
-    // Validate room and password
+    // Validate room and password first
     let mut room = ctx.db.room().name().find(&room_name)
         .ok_or_else(|| format!("Room '{}' does not exist", room_name))?;
 
     // Check password if set
-    if let Some(stored_password) = &room.password {
-        if stored_password != &password {
+    if let Some(ref stored_password) = room.password {
+        if password.is_empty() || stored_password.as_str() != password.as_str() {
             return Err("Incorrect password".to_string());
         }
     }
@@ -309,30 +300,38 @@ pub fn join_room(ctx: &ReducerContext, room_name: String, password: String) -> R
         return Err("Room is full".to_string());
     }
 
-    // Leave current room first
-    if let Some(mut old_room) = ctx.db.room().name().find(&player.room_name) {
-        old_room.current_player_count = old_room.current_player_count.saturating_sub(1);
-        ctx.db.room().name().update(old_room.clone());
-        
-        // Delete empty room if not owned by this player
-        if old_room.current_player_count == 0 && old_room.owner_identity != identity {
-            ctx.db.room().name().delete(&old_room.name);
-            spacetimedb::log::info!("Deleted empty room: {}", old_room.name);
+    // If player exists, handle room transition
+    if let Some(player) = ctx.db.player().identity().find(identity) {
+        // Check if already in this room
+        if player.room_name == room_name {
+            return Err("Already in this room".to_string());
         }
+
+        // Leave current room first
+        if let Some(mut old_room) = ctx.db.room().name().find(&player.room_name) {
+            old_room.current_player_count = old_room.current_player_count.saturating_sub(1);
+            ctx.db.room().name().update(old_room.clone());
+            
+            // Delete empty room if not owned by this player
+            if old_room.current_player_count == 0 && old_room.owner_identity != identity {
+                ctx.db.room().name().delete(&old_room.name);
+                spacetimedb::log::info!("Deleted empty room: {}", old_room.name);
+            }
+        }
+
+        // Update player's room
+        let mut updated_player = player;
+        updated_player.room_name = room_name.clone();
+        updated_player.current_vote = String::new();
+        updated_player.has_voted = false;
+        ctx.db.player().identity().update(updated_player);
     }
 
     // Update new room count
     room.current_player_count += 1;
     ctx.db.room().name().update(room);
-
-    // Update player's room
-    let mut updated_player = player;
-    updated_player.room_name = room_name.clone();
-    updated_player.current_vote = String::new();
-    updated_player.has_voted = false;
-    ctx.db.player().identity().update(updated_player);
-    spacetimedb::log::info!("Player {} moved to room {}", identity, room_name);
     
+    spacetimedb::log::info!("Player {} joined room {}", identity, room_name);
     Ok(())
 }
 
