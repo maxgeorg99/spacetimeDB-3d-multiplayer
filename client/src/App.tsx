@@ -455,18 +455,23 @@ function App() {
   }, []);
 
   // --- handleJoinGame ---
-  const handleJoinGame = (username: string, characterClass: string) => {
+  const handleJoinGame = async (username: string, characterClass: string) => {
     if (!conn) {
-        console.error("Cannot join game, not connected.");
-        return;
+      console.error("Cannot join game, not connected.");
+      return;
     }
     if (!selectedRoomName) {
-        console.error("No room selected.");
-        return;
+      console.error("No room selected.");
+      return;
     }
-    console.log(`Registering as ${username} (${characterClass}) in room ${selectedRoomName}...`);
-    conn.reducers.registerPlayer(username, characterClass, selectedRoomName);
-    setShowJoinDialog(false);
+    try {
+      console.log(`Registering as ${username} (${characterClass}) in room ${selectedRoomName}...`);
+      await conn.reducers.registerPlayer(username, characterClass, selectedRoomName);
+      setShowJoinDialog(false);
+    } catch (error) {
+      console.error("Failed to register player:", error);
+      setStatusMessage(`Failed to register: ${error}`);
+    }
   };
 
   // Room management handlers
@@ -483,16 +488,18 @@ function App() {
     }
   }, [conn]);
 
-  const handleJoinRoom = useCallback((roomName: string, password?: string) => {
+  const handleJoinRoom = useCallback(async (roomName: string, password?: string) => {
     if (!conn) return;
     try {
-      conn.reducers.joinRoom(roomName, password || "");
+      await conn.reducers.joinRoom(roomName, password || "");
       setSelectedRoomName(roomName);
       setShowMainMenu(false);
       setShowJoinDialog(true); // Show join dialog after joining a room
     } catch (error) {
       console.error("Failed to join room:", error);
       setStatusMessage(`Failed to join room: ${error}`);
+      // Don't proceed to join dialog if join failed
+      return;
     }
   }, [conn]);
 

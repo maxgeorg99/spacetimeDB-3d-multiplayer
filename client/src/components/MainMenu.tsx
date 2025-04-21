@@ -1,29 +1,66 @@
 import { useState } from 'react';
 
+interface Room {
+  id: string;
+  name: string;
+  playerCount: number;
+  maxPlayers: number;
+  hasPassword: boolean;
+}
+
+interface MainMenuProps {
+  onCreateRoom: (name: string, password?: string) => void;
+  onJoinRoom: (roomId: string, password?: string) => void;
+  availableRooms: Room[];
+  isConnected: boolean;
+}
+
 export function MainMenu({ 
   onCreateRoom, 
   onJoinRoom, 
   availableRooms,
   isConnected 
-}) {
+}: MainMenuProps) {
   const [newRoomName, setNewRoomName] = useState('');
   const [roomPassword, setRoomPassword] = useState('');
   const [showCreateForm, setShowCreateForm] = useState(false);
+  const [error, setError] = useState<string | null>(null);
   
   // Handle room creation
-  const handleCreateRoom = (e) => {
+  const handleCreateRoom = async (e: React.FormEvent) => {
     e.preventDefault();
+    setError(null);
     if (newRoomName.trim()) {
-      onCreateRoom(newRoomName, roomPassword);
-      setNewRoomName('');
-      setRoomPassword('');
-      setShowCreateForm(false);
+      try {
+        await onCreateRoom(newRoomName, roomPassword);
+        setNewRoomName('');
+        setRoomPassword('');
+        setShowCreateForm(false);
+      } catch (err) {
+        setError(err instanceof Error ? err.message : String(err));
+      }
     }
   };
 
   // Handle room selection
-  const handleRoomSelect = (roomId) => {
-    onJoinRoom(roomId);
+  const handleRoomSelect = async (roomId: string) => {
+    const room = availableRooms.find(r => r.id === roomId);
+    if (!room) {
+      setError('Room not found');
+      return;
+    }
+    
+    if (room.playerCount >= room.maxPlayers) {
+      setError(`Room "${room.name}" is full (${room.playerCount}/${room.maxPlayers} players)`);
+      return;
+    }
+
+    setError(null);
+    try {
+      await onJoinRoom(roomId);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err));
+    }
   };
 
   return (
@@ -40,6 +77,12 @@ export function MainMenu({
         
         {isConnected && (
           <>
+            {error && (
+              <div className="error-message">
+                {error}
+              </div>
+            )}
+            
             <div className="menu-actions">
               <button 
                 className="menu-button primary-button"
@@ -101,12 +144,16 @@ export function MainMenu({
                   {availableRooms.map(room => (
                     <li 
                       key={room.id} 
-                      className="room-item"
+                      className={`room-item ${room.playerCount >= room.maxPlayers ? 'room-full' : ''}`}
                       onClick={() => handleRoomSelect(room.id)}
                     >
                       <div className="room-info">
                         <span className="room-name">{room.name}</span>
-                        <span className="room-players">{room.playerCount} / {room.maxPlayers} players</span>
+                        <span className="room-players" style={{ 
+                          color: room.playerCount >= room.maxPlayers ? '#ff5252' : 'inherit' 
+                        }}>
+                          {room.playerCount} / {room.maxPlayers} players
+                        </span>
                       </div>
                       {room.hasPassword && (
                         <span className="room-password-indicator">🔒</span>

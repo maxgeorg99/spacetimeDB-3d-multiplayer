@@ -284,35 +284,54 @@ pub fn create_room(ctx: &ReducerContext, room_name: String) -> Result<(), String
 pub fn join_room(ctx: &ReducerContext, room_name: String, password: String) -> Result<(), String> {
     let identity = ctx.sender;
     
-    if let Some(mut room) =  ctx.db.room().name().find(&room_name) {
-        // Check password
-        if let Some(room_password) = &room.password {
-            if room_password != &password {
-                return Err("Incorrect password".to_string());
-            }
-        }
-        // Check if room is full
-        if room.current_player_count >= room.max_players {
-            return Err("Room is full".to_string());
-        }
-        // Increment player count
-        room.current_player_count += 1;
-        ctx.db.room().name().update(room);
-    } else {
-        return Err(format!("Room '{}' does not exist", room_name));
+    // First check if player exists
+    let player = ctx.db.player().identity().find(identity)
+        .ok_or_else(|| "Please register before joining a room".to_string())?;
+
+    // Then check if player is already in this room
+    if player.room_name == room_name {
+        return Err("Already in this room".to_string());
     }
 
-    if let Some(mut player) = ctx.db.player().identity().find(identity) {
-        // Player exists, update their room
-        player.room_name = room_name.clone();
-        player.current_vote = String::new();
-        player.has_voted = false;
-        ctx.db.player().identity().update(player);
-        spacetimedb::log::info!("Player {} moved to room {}.", identity, room_name);
-    } else {
-        // Player doesn't exist - they need to register first!
-        return Err("Please register before joining a room".to_string());
+    // Validate room and password
+    let mut room = ctx.db.room().name().find(&room_name)
+        .ok_or_else(|| format!("Room '{}' does not exist", room_name))?;
+
+    // Check password if set
+    if let Some(stored_password) = &room.password {
+        if stored_password != &password {
+            return Err("Incorrect password".to_string());
+        }
     }
+
+    // Check if room is full
+    if room.current_player_count >= room.max_players {
+        return Err("Room is full".to_string());
+    }
+
+    // Leave current room first
+    if let Some(mut old_room) = ctx.db.room().name().find(&player.room_name) {
+        old_room.current_player_count = old_room.current_player_count.saturating_sub(1);
+        ctx.db.room().name().update(old_room.clone());
+        
+        // Delete empty room if not owned by this player
+        if old_room.current_player_count == 0 && old_room.owner_identity != identity {
+            ctx.db.room().name().delete(&old_room.name);
+            spacetimedb::log::info!("Deleted empty room: {}", old_room.name);
+        }
+    }
+
+    // Update new room count
+    room.current_player_count += 1;
+    ctx.db.room().name().update(room);
+
+    // Update player's room
+    let mut updated_player = player;
+    updated_player.room_name = room_name.clone();
+    updated_player.current_vote = String::new();
+    updated_player.has_voted = false;
+    ctx.db.player().identity().update(updated_player);
+    spacetimedb::log::info!("Player {} moved to room {}", identity, room_name);
     
     Ok(())
 }
@@ -333,63 +352,86 @@ pub fn register_player(
         room_name
     );
 
-    // Check if room exists (and create it if it doesn't)
-    if !ctx.db.room().name().find(&room_name).is_some() {
+    // First, handle the room creation/update
+    let mut room = if let Some(existing_room) = ctx.db.room().name().find(&room_name) {
+        if existing_room.current_player_count >= existing_room.max_players {
+            return Err("Room is full".to_string());
+        }
+        existing_room
+    } else {
         // Create the room if it doesn't exist
-        let new_room = Room {
+        Room {
             name: room_name.clone(),
             password: None,
             max_players: MAX_PLAYERS_PER_ROOM,
             current_player_count: 0,
             created_at: ctx.timestamp,
             owner_identity: ctx.sender,
-        };
-        ctx.db.room().insert(new_room);
-        spacetimedb::log::info!("Created new room: {}", room_name);
-    }
+        }
+    };
 
-    if ctx.db.player().identity().find(player_identity).is_some() {
-        // If player already exists, just update their room
-        let mut player = ctx.db.player().identity().find(player_identity).unwrap();
-        player.room_name = room_name.clone();
-        player.current_vote = String::new();
-        player.has_voted = false;
-        ctx.db.player().identity().update(player);
-        spacetimedb::log::info!("Player {} moved to room {}.", player_identity, room_name);
+    // If player exists, handle room transition
+    if let Some(existing_player) = ctx.db.player().identity().find(player_identity) {
+        // If moving to a different room
+        if existing_player.room_name != room_name {
+            // Decrease old room count
+            if let Some(mut old_room) = ctx.db.room().name().find(&existing_player.room_name) {
+                old_room.current_player_count = old_room.current_player_count.saturating_sub(1);
+                ctx.db.room().name().update(old_room.clone());
+                
+                // Clean up empty old room if needed
+                if old_room.current_player_count == 0 && old_room.owner_identity != player_identity {
+                    ctx.db.room().name().delete(&old_room.name);
+                    spacetimedb::log::info!("Deleted empty room: {}", old_room.name);
+                }
+            }
+            
+            // Increase new room count
+            room.current_player_count += 1;
+            if !ctx.db.room().name().find(&room_name).is_some() {
+                ctx.db.room().insert(room.clone());
+            } else {
+                ctx.db.room().name().update(room);
+            }
+            
+            // Update player's room
+            let mut updated_player = existing_player;
+            updated_player.room_name = room_name;
+            updated_player.current_vote = String::new();
+            updated_player.has_voted = false;
+            ctx.db.player().identity().update(updated_player);
+        }
         return Ok(());
     }
 
-    if let Some(logged_out_player) = ctx.db.logged_out_player().identity().find(player_identity) {
+    // Handle new player or rejoining player
+    let new_player = if let Some(logged_out_player) = ctx.db.logged_out_player().identity().find(player_identity) {
         spacetimedb::log::info!("Player {} is rejoining in room {}.", player_identity, room_name);
-        
-        // Base initialization from the helper function
         let mut rejoining_player = initialize_player(
             ctx, 
             logged_out_player.identity,
-            logged_out_player.username.clone(),
-            logged_out_player.character_class.clone(),
-            room_name
+            logged_out_player.username,
+            logged_out_player.character_class,
+            room_name.clone()
         );
-        
-        // Preserve some values from the logged out player
-        rejoining_player.rotation = logged_out_player.rotation.clone();
-        
-        ctx.db.player().insert(rejoining_player);
+        rejoining_player.rotation = logged_out_player.rotation;
         ctx.db.logged_out_player().identity().delete(player_identity);
+        rejoining_player
     } else {
-        spacetimedb::log::info!("Registering new player {} in room {}.", player_identity, room_name);
-        
-        // Use the helper function for new player initialization
-        let new_player = initialize_player(
-            ctx,
-            player_identity,
-            username,
-            character_class,
-            room_name
-        );
-        
-        ctx.db.player().insert(new_player);
+        initialize_player(ctx, player_identity, username, character_class, room_name.clone())
+    };
+
+    // Update room count and insert the player
+    room.current_player_count += 1;
+    if !ctx.db.room().name().find(&room_name).is_some() {
+        ctx.db.room().insert(room);
+    } else {
+        ctx.db.room().name().update(room);
     }
+    
+    // Insert the player AFTER room is updated
+    ctx.db.player().insert(new_player);
+    spacetimedb::log::info!("Player {} registered in room {}", player_identity, room_name);
     
     Ok(())
 }
