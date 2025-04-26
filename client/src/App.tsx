@@ -52,6 +52,7 @@ import * as THREE from 'three';
 // import { PlayerUI } from './components/PlayerUI';
 import { VotingPanel } from './components/VotingPanel';
 import { MainMenu } from './components/MainMenu';
+import { VotingStatus } from './generated/voting_status_type';
 
 // Type Aliases
 type DbConnection = moduleBindings.DbConnection;
@@ -61,6 +62,8 @@ type PlayerData = moduleBindings.PlayerData;
 type InputState = moduleBindings.InputState;
 type GameTile = moduleBindings.GameTile;
 type Room = moduleBindings.Room;
+type Vote = moduleBindings.Vote;
+type Voting = moduleBindings.Voting;
 // ... other types ...
 
 let conn: DbConnection | null = null;
@@ -78,6 +81,9 @@ function App() {
   const [showMainMenu, setShowMainMenu] = useState(true);
   const [rooms, setRooms] = useState<ReadonlyMap<string, Room>>(new Map());
   const [selectedRoomName, setSelectedRoomName] = useState<string>("");
+  const [votes, setVotes] = useState<ReadonlyMap<string, Vote>>(new Map());
+  const [votings, setVotings] = useState<ReadonlyMap<string, Voting>>(new Map());
+  const [timeRemaining, setTimeRemaining] = useState(10);
 
   // --- Ref for current input state ---
   const currentInputRef = useRef<InputState>({
@@ -92,7 +98,7 @@ function App() {
   const playerRotationRef = useRef<THREE.Euler>(new THREE.Euler(0, 0, 0, 'YXZ'));
 
   // --- Moved Table Callbacks/Subscription Functions Up ---
-  const registerTableCallbacks = useCallback(() => {
+  const registerTableCallbacks = useCallback((activeIdentity: Identity) => {
     if (!conn) return;
     console.log("Registering table callbacks...");
     
@@ -102,9 +108,10 @@ function App() {
     });
 
     conn.db.player.onInsert((_ctx: EventContext, player: PlayerData) => {
-        console.log("Player inserted (callback):", player.identity.toHexString());
+        console.log("Player inserted (callback):", player.identity.toHexString(), "identity:", activeIdentity.toHexString());
         setPlayers((prev: ReadonlyMap<string, PlayerData>) => new Map(prev).set(player.identity.toHexString(), player));
-        if (identity && player.identity.toHexString() === identity.toHexString()) {
+        if (player.identity.toHexString() === activeIdentity.toHexString()) {
+            console.log("Local player registered:", player.identity.toHexString());
             setLocalPlayer(player);
             setStatusMessage(`Registered as ${player.username}`);
         }
@@ -116,7 +123,7 @@ function App() {
             newMap.set(newPlayer.identity.toHexString(), newPlayer);
             return newMap;
         });
-        if (identity && newPlayer.identity.toHexString() === identity.toHexString()) {
+        if (newPlayer.identity.toHexString() === activeIdentity.toHexString()) {
             setLocalPlayer(newPlayer);
         }
     });
@@ -128,7 +135,7 @@ function App() {
             newMap.delete(player.identity.toHexString());
             return newMap;
         });
-        if (identity && player.identity.toHexString() === identity.toHexString()) {
+        if (player.identity.toHexString() === activeIdentity.toHexString()) {
             setLocalPlayer(null);
             setStatusMessage("Local player deleted!");
         }
@@ -152,25 +159,83 @@ function App() {
       });
     });
 
+    // Register voting table callbacks
+    conn.db.voting.onInsert((_ctx: EventContext, voting: Voting) => {
+      console.log("[Voting] New voting session:", voting);
+      setVotings((prev: ReadonlyMap<string, Voting>) => new Map(prev).set(voting.votingId.toString(), voting));
+    });
+
+    conn.db.voting.onUpdate((_ctx: EventContext, _oldVoting: Voting, newVoting: Voting) => {
+      console.log("[Voting] Voting updated:", newVoting);
+      setVotings((prev: ReadonlyMap<string, Voting>) => new Map(prev).set(newVoting.votingId.toString(), newVoting));
+    });
+
+    conn.db.voting.onDelete((_ctx: EventContext, voting: Voting) => {
+      console.log("[Voting] Voting deleted:", voting);
+      setVotings((prev: ReadonlyMap<string, Voting>) => {
+        const newMap = new Map(prev);
+        newMap.delete(voting.votingId.toString());
+        return newMap;
+      });
+    });
+
+    // Register vote table callbacks
+    conn.db.vote.onInsert((_ctx: EventContext, vote: Vote) => {
+      console.log("[Vote] New vote:", vote);
+      setVotes((prev: ReadonlyMap<string, Vote>) => 
+        new Map(prev).set(`${vote.votingId}-${vote.playerIdentity.toHexString()}`, vote)
+      );
+    });
+
+    conn.db.vote.onDelete((_ctx: EventContext, vote: Vote) => {
+      console.log("[Vote] Vote deleted:", vote);
+      setVotes((prev: ReadonlyMap<string, Vote>) => {
+        const newMap = new Map(prev);
+        newMap.delete(`${vote.votingId}-${vote.playerIdentity.toHexString()}`);
+        return newMap;
+      });
+    });
+
     console.log("Table callbacks registered.");
   }, [identity]); // Keep identity dependency
 
   const onSubscriptionApplied = useCallback(() => {
-     console.log("Subscription applied successfully.");
-     setPlayers((prev: ReadonlyMap<string, PlayerData>) => {
-         if (prev.size === 0 && conn) {
-             const currentPlayers = new Map<string, PlayerData>();
-             for (const player of conn.db.player.iter()) {
-                 currentPlayers.set(player.identity.toHexString(), player);
-                 if (identity && player.identity.toHexString() === identity.toHexString()) {
-                     setLocalPlayer(player);
-                 }
-             }
-             return currentPlayers;
-         }
-         return prev;
-     });
-  }, [identity]); // Keep identity dependency
+    console.log("Subscription applied successfully.");
+    if (!conn) return;
+
+    // Initialize all tables from current state
+    const currentPlayers = new Map<string, PlayerData>();
+    for (const player of conn.db.player.iter()) {
+      currentPlayers.set(player.identity.toHexString(), player);
+      if (identity && player.identity.toHexString() === identity.toHexString()) {
+        setLocalPlayer(player);
+      }
+    }
+    setPlayers(currentPlayers);
+
+    // Initialize rooms
+    const currentRooms = new Map<string, Room>();
+    for (const room of conn.db.room.iter()) {
+      currentRooms.set(room.name, room);
+    }
+    setRooms(currentRooms);
+
+    // Initialize votings
+    const currentVotings = new Map<string, Voting>();
+    for (const voting of conn.db.voting.iter()) {
+      currentVotings.set(voting.votingId.toString(), voting);
+    }
+    setVotings(currentVotings);
+
+    // Initialize votes
+    const currentVotes = new Map<string, Vote>();
+    for (const vote of conn.db.vote.iter()) {
+      currentVotes.set(`${vote.votingId}-${vote.playerIdentity.toHexString()}`, vote);
+    }
+    setVotes(currentVotes);
+
+    console.log("Initial state loaded from subscription");
+  }, [conn, identity]);
 
   const onSubscriptionError = useCallback((error: any) => {
       console.error("Subscription error:", error);
@@ -183,6 +248,8 @@ function App() {
     const subscription = conn.subscriptionBuilder();
     subscription.subscribe("SELECT * FROM player");
     subscription.subscribe("SELECT * FROM room");
+    subscription.subscribe("SELECT * FROM voting");
+    subscription.subscribe("SELECT * FROM vote");
     subscription.onApplied(onSubscriptionApplied);
     subscription.onError(onSubscriptionError);
   }, [identity, onSubscriptionApplied, onSubscriptionError]); // Add dependencies
@@ -248,7 +315,7 @@ function App() {
   }, []);
 
   const sendInput = useCallback((currentInputState: InputState) => {
-    if (!conn || !identity || !connected) return; // Check connection status too
+    if (!conn || !identity || !connected || !localPlayer || !localPlayer?.roomName) return;
     const currentPosition = localPlayer?.position || { x: 0, y: 0, z: 0 };
     
     // Now using the playerRotationRef for more accurate rotation tracking
@@ -378,6 +445,21 @@ function App() {
               }
               return;
           }
+
+          // Handle voting time updates
+          if (votings.size > 0) {
+              const currentVotings = Array.from(votings.values());
+              for (const voting of currentVotings) {
+                  if (voting.status === VotingStatus.Pending) {
+                      const now = Date.now();
+                      const elapsedSeconds = Math.floor((now / 1000) - Number(voting.startTime.microsSinceUnixEpoch) / 1_000_000);
+                      const remaining = Math.max(0, voting.duration - elapsedSeconds);
+                      setTimeRemaining(remaining);
+                  }
+              }
+          }
+
+          // Regular game loop updates
           currentInputRef.current.sequence += 1;
           sendInput(currentInputRef.current);
           animationFrameIdRef.current = requestAnimationFrame(gameLoop);
@@ -395,7 +477,7 @@ function App() {
               animationFrameIdRef.current = null;
           }
       };
-  }, [connected, conn, identity, sendInput]);
+  }, [connected, conn, identity, sendInput, votings]);
 
   // --- Connection Effect Hook ---
   useEffect(() => {
@@ -421,10 +503,10 @@ function App() {
       setConnected(true);
       setStatusMessage(`Connected as ${id.toHexString().substring(0, 8)}...`);
       subscribeToTables();
-      registerTableCallbacks();
+      registerTableCallbacks(id);
       setupInputListeners();
       setupDelegatedListeners();
-      setShowMainMenu(true); // Show main menu on connect
+      setShowMainMenu(true);
     };
 
     const onDisconnect = (_ctx: ErrorContext, reason?: Error | null) => {
@@ -464,9 +546,11 @@ function App() {
       console.error("No room selected.");
       return;
     }
-    try {
+    try {      
       console.log(`Registering as ${username} (${characterClass}) in room ${selectedRoomName}...`);
-      await conn.reducers.registerPlayer(username, characterClass, selectedRoomName);
+      conn.reducers.registerPlayer(username, characterClass, selectedRoomName);
+      
+      setLocalPlayer(null); // Reset local player to force re-fetch
       setShowJoinDialog(false);
     } catch (error) {
       console.error("Failed to register player:", error);
@@ -528,21 +612,6 @@ function App() {
       
       {showJoinDialog && !showMainMenu && <JoinGameDialog onJoin={handleJoinGame} />}
       
-      {/* Conditionally render DebugPanel based on connection status */} 
-      {/* Visibility controlled internally, expansion controlled by state */}
-      {/*
-      {connected && (
-          <DebugPanel 
-            statusMessage={statusMessage}
-            localPlayer={localPlayer}
-            identity={identity}
-            playerMap={players}
-            expanded={isDebugPanelExpanded}
-            onToggleExpanded={() => setIsDebugPanelExpanded((prev: boolean) => !prev)}
-            isPointerLocked={isPointerLocked}
-          />
-      )}
-      */}
 
       {/* Render GameScene and PlayerUI only when connected */}
 
@@ -557,13 +626,16 @@ function App() {
             currentInputRef={currentInputRef}
             isDebugPanelVisible={isDebugPanelExpanded}
           />
-          {/* Render PlayerUI & Voting Panel only if localPlayer exists */} 
+          {/* Voting Panel only if localPlayer exists */} 
           {localPlayer && (
             <>
               <VotingPanel
                 localPlayer={localPlayer}
                 players={new Map(players)}
                 conn={conn}
+                votes={new Map(votes)}
+                voting={new Map(votings)}
+                timeRemaining={timeRemaining}
               />
             </>
           )}

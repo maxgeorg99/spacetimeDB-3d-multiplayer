@@ -83,6 +83,36 @@ pub struct GameTile {
     size: Vector3,
 }
 
+#[derive(Clone, PartialEq, spacetimedb::SpacetimeType)]
+pub enum VotingStatus {
+    Pending,
+    Completed,
+}
+
+#[spacetimedb::table(name = voting, public)]
+#[derive(Clone)]
+pub struct Voting {
+    #[primary_key]
+    #[auto_inc]
+    voting_id: u64,
+    #[index(btree)]
+    room_name: String,
+    status: VotingStatus,
+    result: Option<String>,
+    start_time: Timestamp,
+    duration: u32,  // Duration in seconds
+}
+
+#[spacetimedb::table(name = vote, public)]
+#[derive(Clone)]
+pub struct Vote {
+    #[primary_key]
+    voting_id: u64,
+    #[index(btree)]
+    player_identity: Identity,
+    vote_value: String,
+}
+
 #[spacetimedb::table(name = player, public)]
 #[derive(Clone)]
 pub struct PlayerData {
@@ -100,8 +130,6 @@ pub struct PlayerData {
     last_input_seq: u32,
     input: InputState,
     color: String,
-    has_voted: bool,
-    current_vote: String,
     #[index(btree)]
     room_name: String,
 }
@@ -254,8 +282,6 @@ fn initialize_player(
         input: default_input,
         color: assigned_color,
         room_name,
-        current_vote: String::new(),
-        has_voted: false,
     }
 }
 
@@ -322,8 +348,6 @@ pub fn join_room(ctx: &ReducerContext, room_name: String, password: String) -> R
         // Update player's room
         let mut updated_player = player;
         updated_player.room_name = room_name.clone();
-        updated_player.current_vote = String::new();
-        updated_player.has_voted = false;
         ctx.db.player().identity().update(updated_player);
     }
 
@@ -351,7 +375,7 @@ pub fn register_player(
         room_name
     );
 
-    // First, handle the room creation/update
+    // First, handle the room validation
     let mut room = if let Some(existing_room) = ctx.db.room().name().find(&room_name) {
         if existing_room.current_player_count >= existing_room.max_players {
             return Err("Room is full".to_string());
@@ -371,35 +395,31 @@ pub fn register_player(
 
     // If player exists, handle room transition
     if let Some(existing_player) = ctx.db.player().identity().find(player_identity) {
-        // If moving to a different room
-        if existing_player.room_name != room_name {
-            // Decrease old room count
-            if let Some(mut old_room) = ctx.db.room().name().find(&existing_player.room_name) {
-                old_room.current_player_count = old_room.current_player_count.saturating_sub(1);
-                ctx.db.room().name().update(old_room.clone());
-                
-                // Clean up empty old room if needed
-                if old_room.current_player_count == 0 && old_room.owner_identity != player_identity {
-                    ctx.db.room().name().delete(&old_room.name);
-                    spacetimedb::log::info!("Deleted empty room: {}", old_room.name);
-                }
-            }
-            
-            // Increase new room count
-            room.current_player_count += 1;
-            if !ctx.db.room().name().find(&room_name).is_some() {
-                ctx.db.room().insert(room.clone());
-            } else {
-                ctx.db.room().name().update(room);
-            }
-            
-            // Update player's room
-            let mut updated_player = existing_player;
-            updated_player.room_name = room_name;
-            updated_player.current_vote = String::new();
-            updated_player.has_voted = false;
-            ctx.db.player().identity().update(updated_player);
+        // If already in this room, just return success without changing anything
+        if existing_player.room_name == room_name {
+            return Ok(());
         }
+
+        // Moving to a different room - decrease old room count
+        if let Some(mut old_room) = ctx.db.room().name().find(&existing_player.room_name) {
+            old_room.current_player_count = old_room.current_player_count.saturating_sub(1);
+            ctx.db.room().name().update(old_room.clone());
+            
+            // Clean up empty old room if needed
+            if old_room.current_player_count == 0 && old_room.owner_identity != player_identity {
+                ctx.db.room().name().delete(&old_room.name);
+                spacetimedb::log::info!("Deleted empty room: {}", old_room.name);
+            }
+        }
+        
+        // Update player's room
+        let mut updated_player = existing_player;
+        updated_player.room_name = room_name.clone();
+        ctx.db.player().identity().update(updated_player);
+        
+        // Update new room's count
+        room.current_player_count += 1;
+        ctx.db.room().name().update(room);
         return Ok(());
     }
 
@@ -420,14 +440,14 @@ pub fn register_player(
         initialize_player(ctx, player_identity, username, character_class, room_name.clone())
     };
 
-    // Update room count and insert the player
+    // Update or insert the room with incremented count
     room.current_player_count += 1;
-    if !ctx.db.room().name().find(&room_name).is_some() {
+    if ctx.db.room().name().find(&room_name).is_none() {
         ctx.db.room().insert(room);
     } else {
         ctx.db.room().name().update(room);
     }
-    
+
     // Insert the player AFTER room is updated
     ctx.db.player().insert(new_player);
     spacetimedb::log::info!("Player {} registered in room {}", player_identity, room_name);
@@ -458,41 +478,80 @@ pub fn game_tick(ctx: &ReducerContext, _tick_info: GameTickSchedule) {
     
     player_logic::update_players_logic(ctx, delta_time);
     
+    // Check for completed votes
+    check_voting_completion(ctx);
+    
     spacetimedb::log::debug!("Game tick completed");
 }
 
-#[spacetimedb::reducer]
-pub fn submit_vote(ctx: &ReducerContext, vote: String) -> Result<(), String> {
-    let identity = ctx.sender;
-    
-    // Validate vote
-    let valid_votes = vec!["S", "M", "L", "XL"];
-    if !valid_votes.contains(&vote.as_str()) {
-        return Err("Invalid vote. Must be one of: S, M, L, XL".to_string());
-    }
+#[spacetimedb::reducer(update)]
+pub fn check_voting_completion(ctx: &ReducerContext) {
+    // Find all pending votes that have exceeded their duration
+    let completed_votes: Vec<_> = ctx.db.voting()
+        .iter()
+        .filter(|v| {
+            if v.status != VotingStatus::Pending {
+                return false;
+            }
+            
+            // Calculate elapsed time in microseconds
+            let elapsed_micros = ctx.timestamp.to_micros_since_unix_epoch()
+                .saturating_sub(v.start_time.to_micros_since_unix_epoch());
+            // Convert to seconds
+            let elapsed_seconds = (elapsed_micros / 1_000_000) as u32;
+            
+            // Log for debugging
+            spacetimedb::log::info!(
+                "[VOTING] Checking completion - ID: {}, Room: {}, Elapsed: {}s/{} required",
+                v.voting_id, v.room_name, elapsed_seconds, v.duration
+            );
+            
+            // Compare with duration
+            elapsed_seconds >= v.duration
+        })
+        .collect();
 
-    // Update player's vote
-    if let Some(mut player) = ctx.db.player().identity().find(identity) {
-        player.current_vote = vote;
-        player.has_voted = true;
-        ctx.db.player().identity().update(player);
-        Ok(())
-    } else {
-        Err("Player not found".to_string())
-    }
-}
+    for mut voting in completed_votes {
+        spacetimedb::log::info!(
+            "[VOTING] Processing completed vote ID: {}, Room: {}",
+            voting.voting_id, voting.room_name
+        );
+        
+        // Get all votes for this voting session
+        let votes: Vec<_> = ctx.db.vote()
+            .iter()
+            .filter(|v| v.voting_id == voting.voting_id)
+            .map(|v| v.vote_value)
+            .collect();
 
-#[spacetimedb::reducer]
-pub fn reset_votes(ctx: &ReducerContext) -> Result<(), String> {
-    // Reset all players' votes
-    for player_id in ctx.db.player().iter().map(|p| p.identity).collect::<Vec<_>>() {
-        if let Some(mut player) = ctx.db.player().identity().find(player_id) {
-            player.current_vote = String::new();
-            player.has_voted = false;
-            ctx.db.player().identity().update(player);
+        spacetimedb::log::info!(
+            "[VOTING] Vote count for ID {}: {}",
+            voting.voting_id,
+            votes.len()
+        );
+
+        // Simple majority calculation
+        let mut vote_counts: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+        for vote in votes {
+            *vote_counts.entry(vote).or_insert(0) += 1;
         }
+
+        let result = vote_counts
+            .into_iter()
+            .max_by_key(|&(_, count)| count)
+            .map(|(value, _)| value);
+
+        spacetimedb::log::info!(
+            "[VOTING] Final result for ID {}: {:?}",
+            voting.voting_id,
+            result
+        );
+
+        // Update voting status
+        voting.status = VotingStatus::Completed;
+        voting.result = result;
+        ctx.db.voting().voting_id().update(voting);
     }
-    Ok(())
 }
 
 #[spacetimedb::reducer]
@@ -556,4 +615,103 @@ pub fn leave_room(ctx: &ReducerContext) -> Result<(), String> {
     } else {
         Err("Player not found".to_string())
     }
+}
+
+#[spacetimedb::reducer]
+pub fn start_voting(ctx: &ReducerContext, room_name: String) -> Result<(), String> {
+    let identity = ctx.sender;
+    spacetimedb::log::info!("[VOTING] Starting voting session in room: {}", room_name);
+    
+    // Check if player is in the specified room
+    let player = match ctx.db.player().identity().find(identity) {
+        Some(p) => p,
+        None => {
+            spacetimedb::log::warn!("[VOTING] Player {} not found", identity);
+            return Err("Player not found".to_string());
+        }
+    };
+    
+    if player.room_name != room_name {
+        spacetimedb::log::warn!("[VOTING] Player {} tried to start vote in wrong room {} (is in {})", 
+            identity, room_name, player.room_name);
+        return Err("Can only start voting in your current room".to_string());
+    }
+
+    // Check if there's already an active vote in this room
+    let active_vote = ctx.db.voting()
+        .iter()
+        .find(|v| v.room_name == room_name && v.status == VotingStatus::Pending);
+    
+    if active_vote.is_some() {
+        spacetimedb::log::warn!("[VOTING] Attempted to start vote while one is in progress in room {}", room_name);
+        return Err("A vote is already in progress in this room".to_string());
+    }
+
+    // Create new voting session
+    let voting = Voting {
+        voting_id: 0, // Auto-incremented
+        room_name: room_name.clone(),
+        status: VotingStatus::Pending,
+        result: None,
+        start_time: ctx.timestamp,
+        duration: 10, // 10 seconds duration
+    };
+
+    spacetimedb::log::info!("[VOTING] Creating new voting session in room {}", room_name);
+    ctx.db.voting().insert(voting);
+    Ok(())
+}
+
+#[spacetimedb::reducer]
+pub fn submit_vote(ctx: &ReducerContext, vote_value: String) -> Result<(), String> {
+    let identity = ctx.sender;
+    spacetimedb::log::info!("[VOTE] Player {} submitting vote: {}", identity, vote_value);
+    
+    // Validate vote
+    let valid_votes = vec!["S", "M", "L", "XL"];
+    if !valid_votes.contains(&vote_value.as_str()) {
+        spacetimedb::log::warn!("[VOTE] Invalid vote value: {}", vote_value);
+        return Err("Invalid vote. Must be one of: S, M, L, XL".to_string());
+    }
+
+    // Get player's room
+    let player = match ctx.db.player().identity().find(identity) {
+        Some(p) => p,
+        None => {
+            spacetimedb::log::warn!("[VOTE] Player {} not found", identity);
+            return Err("Player not found".to_string());
+        }
+    };
+
+    // Find active voting session in the room
+    let voting = match ctx.db.voting()
+        .iter()
+        .find(|v| v.room_name == player.room_name && v.status == VotingStatus::Pending)
+    {
+        Some(v) => v,
+        None => {
+            spacetimedb::log::warn!("[VOTE] No active voting session in room {}", player.room_name);
+            return Err("No active voting session found".to_string());
+        }
+    };
+
+    // Check if player already voted
+    if ctx.db.vote()
+        .iter()
+        .any(|v| v.voting_id == voting.voting_id && v.player_identity == identity) {
+        spacetimedb::log::warn!("[VOTE] Player {} attempted to vote again", identity);
+        return Err("Already voted in this session".to_string());
+    }
+
+    // Record the vote
+    let vote = Vote {
+        voting_id: voting.voting_id,
+        player_identity: identity,
+        vote_value: vote_value.clone(),
+    };
+    spacetimedb::log::info!("[VOTE] Recording vote for player {} in voting {}: {}", 
+        identity, voting.voting_id, vote_value);
+    ctx.db.vote().insert(vote);
+
+    Ok(())
 }

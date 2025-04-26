@@ -1,64 +1,55 @@
-import React, { useState, useEffect } from 'react';
-import { PlayerData, DbConnection } from '../generated';
+import React, { useEffect } from 'react';
+import { PlayerData, DbConnection, Vote, Voting, VotingStatus } from '../generated';
 
 interface VotingPanelProps {
   localPlayer: PlayerData | null;
   players: Map<string, PlayerData>;
   conn: DbConnection | null;
+  votes: Map<string, Vote>;
+  voting: Map<string, Voting>;
+  timeRemaining: number;
 }
 
-export const VotingPanel: React.FC<VotingPanelProps> = ({ localPlayer, players, conn }) => {
-  const [votingActive, setVotingActive] = useState(false);
-  const [countdown, setCountdown] = useState(10);
-  const [showResults, setShowResults] = useState(false);
+export const VotingPanel: React.FC<VotingPanelProps> = ({ 
+  localPlayer, 
+  players, 
+  conn,
+  votes,
+  voting,
+  timeRemaining
+}) => {
+  const getCurrentVoting = () => {
+    if (!localPlayer) return null;
+    return Array.from(voting.values())
+      .find(v => v.roomName === localPlayer.roomName && v.status === VotingStatus.Pending);
+  };
 
-  // Recursive timeout for countdown (prevents interval stacking)
-  useEffect(() => {
-    if (!votingActive || countdown <= 0) return;
+  const getCurrentVotes = () => {
+    const currentVoting = getCurrentVoting();
+    if (!currentVoting) return [];
+    return Array.from(votes.values())
+      .filter(v => v.votingId === currentVoting.votingId)
+      .map(v => {
+        const player = Array.from(players.values()).find(p => p.identity.toHexString() === v.playerIdentity.toHexString());
+        return {
+          name: player?.username || 'Unknown',
+          vote: v.voteValue
+        };
+      })
+      .sort((a, b) => a.name.localeCompare(b.name));
+  };
 
-    const timer = setTimeout(() => {
-      setCountdown(prev => prev - 1);
-    }, 1000);
-
-    return () => clearTimeout(timer);
-  }, [countdown, votingActive]);
-
-  // Submit vote and end voting
-  useEffect(() => {
-    if (votingActive && countdown === 0 && !showResults) {
-      console.log('[VotingPanel] Countdown reached 0. Attempting to submit vote...');
-      
-      if (localPlayer && conn) {
-        console.log('[VotingPanel] Local player position:', localPlayer.position);
-        const tileInfo = getTileInfo(localPlayer.position);
-  
-        if (tileInfo) {
-          console.log('[VotingPanel] Tile found:', tileInfo);
-          conn.reducers.submitVote(tileInfo.size);
-        } else {
-          console.warn('[VotingPanel] No tile matched player position!');
-        }
-      } else {
-        console.warn('[VotingPanel] Missing localPlayer or conn, cannot submit vote.');
-      }
-      console.log('[VotingPanel] localPlayer:', localPlayer);
-      console.log('[VotingPanel] conn:', conn);
-  
-      setShowResults(true);
-      setVotingActive(false);
-    }
-  }, [votingActive, countdown, showResults, localPlayer, conn]);  
-
-  const startVoting = () => {
-    if (!conn) return;
-    setVotingActive(true);
-    setCountdown(10);
-    setShowResults(false);
-    conn.reducers.resetVotes();
+  const hasPlayerVoted = () => {
+    const currentVoting = getCurrentVoting();
+    if (!currentVoting || !localPlayer) return false;
+    return Array.from(votes.values())
+      .some(v => 
+        v.votingId === currentVoting.votingId && 
+        v.playerIdentity.toHexString() === localPlayer.identity.toHexString()
+      );
   };
 
   const getTileInfo = (position: { x: number, z: number }) => {
-    console.log('[TileInfo] Checking position:', position);
     const tileSize = 8;
     const tiles = [
       { x: -15, z: 0, size: "S" },
@@ -75,20 +66,51 @@ export const VotingPanel: React.FC<VotingPanelProps> = ({ localPlayer, players, 
   
       if (position.x >= xMin && position.x <= xMax &&
           position.z >= zMin && position.z <= zMax) {
-        console.log(`[TileInfo] Match found: ${tile.size}`);
         return tile;
       }
     }
-  
-    console.warn('[TileInfo] No matching tile found');
     return null;
-  };  
+  };
 
-  const allPlayersVoted = Array.from(players.values()).every(p => p.hasVoted);
-  const votingResults = Array.from(players.values())
-    .filter(p => p.hasVoted)
-    .sort((a, b) => a.username.localeCompare(b.username))
-    .map(p => ({ name: p.username, vote: p.currentVote }));
+  const startVoting = () => {
+    if (!conn || !localPlayer) {
+      console.log("[VotingPanel] Cannot start voting: no connection or player", { conn, localPlayer });
+      return;
+    }
+    console.log("[VotingPanel] Starting voting for room:", localPlayer.roomName);
+    conn.reducers.startVoting(localPlayer.roomName);
+  };
+
+  const submitVote = () => {
+    if (!localPlayer || !conn) {
+      console.log("[VotingPanel] Cannot submit vote: no connection or player", { conn, localPlayer });
+      return;
+    }
+    const tileInfo = getTileInfo(localPlayer.position);
+    console.log("[VotingPanel] Submitting vote with tile info:", tileInfo);
+    if (tileInfo) {
+      conn.reducers.submitVote(tileInfo.size);
+    }
+  };
+
+  // Log state changes for debugging
+  useEffect(() => {
+    console.log("[VotingPanel] State update:", {
+      currentVoting: getCurrentVoting(),
+      votesCount: votes.size,
+      votingCount: voting.size,
+      timeRemaining
+    });
+  }, [voting, votes, timeRemaining]);
+
+  const getCompletedVotingResults = () => {
+    if (!localPlayer) return null;
+    return Array.from(voting.values())
+      .find(v => v.roomName === localPlayer.roomName && v.status === VotingStatus.Completed);
+  };
+
+  const currentVoting = getCurrentVoting();
+  const completedVoting = getCompletedVotingResults();
 
   return (
     <div style={{
@@ -100,11 +122,11 @@ export const VotingPanel: React.FC<VotingPanelProps> = ({ localPlayer, players, 
       borderRadius: '8px',
       color: 'white',
       minWidth: '200px',
-      zIndex: 10
+      zIndex: 1500
     }}>
       <h3>Scrum Poker</h3>
 
-      {!votingActive && !showResults && (
+      {!currentVoting && !completedVoting && (
         <button
           onClick={startVoting}
           style={{
@@ -120,30 +142,48 @@ export const VotingPanel: React.FC<VotingPanelProps> = ({ localPlayer, players, 
         </button>
       )}
 
-      {votingActive && countdown > 0 && (
+      {currentVoting && (
         <div>
           <p>Voting in progress...</p>
-          <p>Time remaining: {countdown}s</p>
+          <p>Time remaining: {timeRemaining}s</p>
           <p>Stand on a tile to cast your vote!</p>
-          {!localPlayer?.hasVoted && (
-            <p style={{ color: 'orange' }}>You haven't voted yet!</p>
+          {!hasPlayerVoted() && (
+            <button
+              onClick={submitVote}
+              style={{
+                padding: '8px 16px',
+                backgroundColor: '#2196F3',
+                border: 'none',
+                borderRadius: '4px',
+                color: 'white',
+                cursor: 'pointer',
+                marginTop: '10px'
+              }}
+            >
+              Submit Vote
+            </button>
           )}
+          <div style={{ marginTop: '10px' }}>
+            <h4>Current Votes:</h4>
+            <ul style={{ paddingLeft: '20px' }}>
+              {getCurrentVotes().map((result, index) => (
+                <li key={index}>
+                  {result.name}: {result.vote}
+                </li>
+              ))}
+            </ul>
+          </div>
         </div>
       )}
 
-      {(showResults || allPlayersVoted) && (
+      {completedVoting && (
         <div>
-          <h4>Voting Results:</h4>
-          <ul style={{ paddingLeft: '20px' }}>
-            {votingResults.map((result, index) => (
-              <li key={index}>
-                {result.name}: {result.vote || '?'}
-              </li>
-            ))}
-          </ul>
+          <h4>Final Result:</h4>
+          <p style={{ fontSize: '24px', fontWeight: 'bold' }}>
+            {completedVoting.result || 'No consensus'}
+          </p>
           <button
             onClick={startVoting}
-            disabled={votingActive}
             style={{
               marginTop: '10px',
               padding: '8px 16px',
@@ -151,8 +191,7 @@ export const VotingPanel: React.FC<VotingPanelProps> = ({ localPlayer, players, 
               border: 'none',
               borderRadius: '4px',
               color: 'white',
-              cursor: votingActive ? 'not-allowed' : 'pointer',
-              opacity: votingActive ? 0.5 : 1
+              cursor: 'pointer'
             }}
           >
             New Vote
