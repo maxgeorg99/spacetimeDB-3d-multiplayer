@@ -93,16 +93,7 @@ export const VotingPanel: React.FC<VotingPanelProps> = ({
     }
   };
 
-  // Log state changes for debugging
-  useEffect(() => {
-    console.log("[VotingPanel] State update:", {
-      currentVoting: getCurrentVoting(),
-      votesCount: votes.size,
-      votingCount: voting.size,
-      timeRemaining
-    });
-  }, [voting, votes, timeRemaining]);
-
+  // Log state changes for debugging 
   const getCompletedVotingResults = () => {
     if (!localPlayer) return null;
     return Array.from(voting.values())
